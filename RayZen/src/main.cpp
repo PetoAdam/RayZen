@@ -5,6 +5,7 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <float.h>
 #include <cmath>
 
@@ -15,21 +16,73 @@
 #include "Material.h"
 #include "Light.h"
 
-const int WIDTH = 800;
-const int HEIGHT = 600;
-const int NUM_SAMPLES = 1;
+// Constants
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+const int MAX_SPHERES = 10;
+const int MAX_MATERIALS = 10;
 
+// Function prototypes
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void processInput(GLFWwindow* window);
+GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
+void setupFramebuffers(GLuint &framebufferA, GLuint &framebufferB, GLuint &textureA, GLuint &textureB, GLuint &rbo);
+void renderToFramebuffer(GLuint framebuffer, GLuint shaderProgram, GLuint quadVAO);
+void displayFramebuffer(GLuint texture, GLuint shaderProgram, GLuint quadVAO);
+
+// Global variables
+GLuint framebufferA, framebufferB;
+GLuint textureA, textureB;
+GLuint rbo;
 GLuint quadVAO, quadVBO;
+GLuint shaderProgram;
 
-void initQuad() {
+void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials) {
+    glUseProgram(shaderProgram);
+
+    GLint viewMatrixLoc = glGetUniformLocation(shaderProgram, "camera.viewMatrix");
+    if (viewMatrixLoc == -1) std::cerr << "Uniform 'camera.viewMatrix' not found!" << std::endl;
+
+    GLint projMatrixLoc = glGetUniformLocation(shaderProgram, "camera.projectionMatrix");
+    if (projMatrixLoc == -1) std::cerr << "Uniform 'camera.projectionMatrix' not found!" << std::endl;
+
+    GLint camPosLoc = glGetUniformLocation(shaderProgram, "camera.position");
+    if (camPosLoc == -1) std::cerr << "Uniform 'camera.position' not found!" << std::endl;
+
+    glUniformMatrix4fv(viewMatrixLoc, 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
+    glUniformMatrix4fv(projMatrixLoc, 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
+    glUniform3fv(camPosLoc, 1, glm::value_ptr(camera.position));
+
+    GLint spheresLoc = glGetUniformLocation(shaderProgram, "spheres");
+    if (spheresLoc == -1) std::cerr << "Uniform 'spheres' not found!" << std::endl;
+    glUniform3fv(glGetUniformLocation(shaderProgram, "spheres[0].center"), spheres.size(), glm::value_ptr(spheres[0].center));
+    glUniform1fv(glGetUniformLocation(shaderProgram, "spheres[0].radius"), spheres.size(), &spheres[0].radius);
+    glUniform1iv(glGetUniformLocation(shaderProgram, "spheres[0].materialIndex"), spheres.size(), &spheres[0].materialIndex);
+    if(glGetUniformLocation(shaderProgram, "spheres[0].radius") == -1) std::cerr << "Materialindex not found" << std::endl;
+
+    GLint materialsLoc = glGetUniformLocation(shaderProgram, "materials");
+    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].diffuse"), materials.size(), glm::value_ptr(materials[0].diffuse));
+    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].specular"), materials.size(), glm::value_ptr(materials[0].specular));
+    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].shininess"), materials.size(), &materials[0].shininess);
+    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].metallic"), materials.size(), &materials[0].metallic);
+    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].fuzz"), materials.size(), &materials[0].fuzz);
+    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].albedo"), materials.size(), glm::value_ptr(materials[0].albedo));
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        std::cerr << "OpenGL Error: " << err << std::endl;
+    }
+}
+
+void setupQuad() {
     GLfloat vertices[] = {
-        // positions        // texCoords
-        -1.0f, -1.0f,  0.0f, 0.0f,
-         1.0f, -1.0f,  1.0f, 0.0f,
-         1.0f,  1.0f,  1.0f, 1.0f,
-        -1.0f,  1.0f,  0.0f, 1.0f
+        // Positions        // Texture Coords
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, 1.0f, 0.0f,
+         1.0f,  1.0f, 1.0f, 1.0f,
+        -1.0f,  1.0f, 0.0f, 1.0f
     };
-    
+
     glGenVertexArrays(1, &quadVAO);
     glGenBuffers(1, &quadVBO);
 
@@ -46,84 +99,163 @@ void initQuad() {
     glBindVertexArray(0);
 }
 
-void renderQuad() {
+void setupFramebuffers(GLuint &framebufferA, GLuint &framebufferB, GLuint &textureA, GLuint &textureB, GLuint &rbo) {
+    glGenFramebuffers(1, &framebufferA);
+    glGenFramebuffers(1, &framebufferB);
+    glGenTextures(1, &textureA);
+    glGenTextures(1, &textureB);
+    glGenRenderbuffers(1, &rbo);
+
+    // Setup framebufferA
+    glBindFramebuffer(GL_FRAMEBUFFER, framebufferA);
+    glBindTexture(GL_TEXTURE_2D, textureA);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureA, 0);
+
+    // Setup framebufferB
+    glBindFramebuffer(GL_FRAMEBUFFER, framebufferB);
+    glBindTexture(GL_TEXTURE_2D, textureB);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureB, 0);
+
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, SCR_WIDTH, SCR_HEIGHT);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "Framebuffer not complete!" << std::endl;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind framebuffer
+}
+
+void renderToFramebuffer(GLuint framebuffer, GLuint shaderProgram, GLuint quadVAO) {
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(shaderProgram);
     glBindVertexArray(quadVAO);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     glBindVertexArray(0);
 }
 
-glm::vec3 rayColor(const Ray& ray, const Scene& scene, int depth);
+void displayFramebuffer(GLuint texture, GLuint shaderProgram, GLuint quadVAO) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-void renderScene(const Camera& camera, Scene& scene, int width, int height, GLuint texture, int num_samples, GLuint shaderProgram) {
-    std::vector<glm::vec3> framebuffer(width * height);
-
-    // Perform ray tracing
-    for (int j = 0; j < height; ++j) {
-        for (int i = 0; i < width; ++i) {
-            glm::vec3 color_sum(0.0f);
-
-            for (int s = 0; s < num_samples; ++s) {
-                float u = (i + drand48()) / float(width);
-                float v = (j + drand48()) / float(height);
-                Ray ray = camera.getRay(u, v);
-                color_sum += rayColor(ray, scene, 2); // 50 is the max recursion depth
-            }
-
-            framebuffer[j * width + i] = color_sum / float(num_samples);
-        }
-    }
-
-    // Upload framebuffer to texture
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_FLOAT, framebuffer.data());
-
-    // Render using the shader program
     glUseProgram(shaderProgram);
     glBindTexture(GL_TEXTURE_2D, texture);
-
-    // Render a full-screen quad
-    renderQuad();
+    glBindVertexArray(quadVAO);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindVertexArray(0);
 }
 
-// Function to calculate ray color based on intersections and lighting
-glm::vec3 rayColor(const Ray& ray, const Scene& scene, int depth) {
-    HitRecord rec;
-    if (depth <= 0) {
-        return glm::vec3(0.0f);
+int main() {
+    if (!glfwInit()) {
+        std::cerr << "Failed to initialize GLFW" << std::endl;
+        return -1;
     }
 
-    if (scene.hit(ray, 0.001f, FLT_MAX, rec)) {
-        glm::vec3 attenuation;
-        glm::vec3 scattered = rec.material->scatter(ray, rec, attenuation);
-        
-        // Lighting calculations
-        glm::vec3 color = glm::vec3(0.0f);
-        for (const auto& light : scene.lights) {
-            glm::vec3 light_dir = glm::normalize(light.position - rec.p);
-            float light_distance = glm::length(light.position - rec.p);
-            
-            // Check for shadows
-            Ray shadow_ray(rec.p, light_dir);
-            HitRecord shadow_rec;
-            if (!scene.hit(shadow_ray, 0.001f, light_distance - 0.001f, shadow_rec)) {
-                float diffuse = glm::max(glm::dot(rec.normal, light_dir), 0.0f);
-                color += attenuation * diffuse * light.intensity;
-            }
-        }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-        // Recursive call for reflected rays
-        glm::vec3 reflected_color = rayColor(Ray(rec.p, scattered), scene, depth - 1);
-        return color * attenuation + reflected_color * attenuation;
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Ray Tracing", nullptr, nullptr);
+    if (window == nullptr) {
+        std::cerr << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+
+    glewExperimental = true;
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "Failed to initialize GLEW" << std::endl;
+        return -1;
     }
 
-    // Background color
-    glm::vec3 unit_direction = glm::normalize(ray.direction);
-    float t = 0.5f * (unit_direction.y + 1.0f);
-    return (1.0f - t) * glm::vec3(1.0f, 1.0f, 1.0f) + t * glm::vec3(0.5f, 0.7f, 1.0f);
+    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+    shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+
+    setupQuad();
+    setupFramebuffers(framebufferA, framebufferB, textureA, textureB, rbo);
+
+    Camera camera(
+        glm::vec3(0.0f, 0.0f, 3.0f),
+        glm::vec3(0.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f),
+        70.0f,
+        (float)SCR_WIDTH / (float)SCR_HEIGHT,
+        0.001f,
+        10000.0f
+    );
+
+    std::vector<Material> materials = {
+        Material(glm::vec3(0.8f, 0.3f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 32.0f, 0.1f, 0.0f, glm::vec3(0.8f, 0.3f, 0.3f)),
+        //Material(glm::vec3(0.3f, 0.8f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.5f, 0.1f, glm::vec3(0.3f, 0.8f, 0.3f))
+    };
+
+    std::vector<Sphere> spheres = {
+        Sphere(glm::vec3(0.0f, 0.0f, -1.0f), 0.5f, 0),
+        //Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.2f, 1)
+    };
+
+    bool useFramebufferA = true;
+
+    while (!glfwWindowShouldClose(window)) {
+        processInput(window);
+
+        // Render to the framebuffer
+        GLuint currentFramebuffer = useFramebufferA ? framebufferA : framebufferB;
+        GLuint currentTexture = useFramebufferA ? textureA : textureB;
+
+        renderToFramebuffer(currentFramebuffer, shaderProgram, quadVAO);
+
+        // Display the result
+        displayFramebuffer(currentTexture, shaderProgram, quadVAO);
+
+        // Swap framebuffers
+        useFramebufferA = !useFramebufferA;
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    glDeleteFramebuffers(1, &framebufferA);
+    glDeleteFramebuffers(1, &framebufferB);
+    glDeleteTextures(1, &textureA);
+    glDeleteTextures(1, &textureB);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteVertexArrays(1, &quadVAO);
+    glDeleteBuffers(1, &quadVBO);
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
 }
 
-GLuint loadShader(const char* vertexPath, const char* fragmentPath) {
-    // Read shader source code
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+
+void processInput(GLFWwindow* window) {
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+}
+
+GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     std::ifstream vShaderFile(vertexPath);
     std::ifstream fShaderFile(fragmentPath);
     std::stringstream vShaderStream, fShaderStream;
@@ -134,7 +266,6 @@ GLuint loadShader(const char* vertexPath, const char* fragmentPath) {
     const char* vShaderCode = vertexCode.c_str();
     const char* fShaderCode = fragmentCode.c_str();
 
-    // Compile vertex shader
     GLuint vertex = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vertex, 1, &vShaderCode, NULL);
     glCompileShader(vertex);
@@ -146,7 +277,6 @@ GLuint loadShader(const char* vertexPath, const char* fragmentPath) {
         std::cerr << "Vertex Shader Compilation Error: " << infoLog << std::endl;
     }
 
-    // Compile fragment shader
     GLuint fragment = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragment, 1, &fShaderCode, NULL);
     glCompileShader(fragment);
@@ -156,7 +286,6 @@ GLuint loadShader(const char* vertexPath, const char* fragmentPath) {
         std::cerr << "Fragment Shader Compilation Error: " << infoLog << std::endl;
     }
 
-    // Link shaders into a program
     GLuint shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertex);
     glAttachShader(shaderProgram, fragment);
@@ -171,90 +300,4 @@ GLuint loadShader(const char* vertexPath, const char* fragmentPath) {
     glDeleteShader(fragment);
 
     return shaderProgram;
-}
-
-int main() {
-    // Initialize GLFW and create a window
-    if (!glfwInit()) {
-        std::cerr << "Failed to initialize GLFW" << std::endl;
-        return -1;
-    }
-
-    // Set GLFW to use OpenGL 3.3 core profile
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "RayZen", nullptr, nullptr);
-    if (!window) {
-        std::cerr << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        return -1;
-    }
-
-    glfwMakeContextCurrent(window);
-
-    // Initialize GLEW
-    if (glewInit() != GLEW_OK) {
-        std::cerr << "Failed to initialize GLEW" << std::endl;
-        return -1;
-    }
-
-    // Initialize quad for rendering
-    initQuad();
-
-    GLuint shaderProgram = loadShader("../shaders/shader.vs", "../shaders/shader.fs");
-    GLuint texture;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, WIDTH, HEIGHT, 0, GL_RGB, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    // Setup Scene
-    Scene scene;
-    // Lambertian material
-    Material lambertian(MaterialType::Lambertian);
-    lambertian.setAlbedo(glm::vec3(0.8f, 0.3f, 0.3f));
-    scene.addObject(Sphere(glm::vec3(0.0f, 0.0f, -1.0f), 0.5f, &lambertian));
-    // Phong material
-    Material phong(MaterialType::Phong);
-    phong.setDiffuse(glm::vec3(0.8f, 0.6f, 0.2f));
-    phong.setSpecular(glm::vec3(1.0f));
-    phong.setShininess(32.0f);
-    scene.addObject(Sphere(glm::vec3(-1.0f, 0.0f, -1.0f), 0.5f, &phong));
-    // Metallic material
-    Material metallic(MaterialType::Metallic);
-    metallic.setAlbedo(glm::vec3(0.8f, 0.8f, 0.8f));
-    metallic.setFuzz(0.3f);
-    scene.addObject(Sphere(glm::vec3(1.0f, 0.0f, -1.0f), 0.5f, &metallic));
-    // Subsurface scattering material
-    Material sss(MaterialType::Subsurface);
-    sss.setAlbedo(glm::vec3(0.7f, 0.5f, 0.3f));
-    sss.setSSSScale(0.1f);
-    scene.addObject(Sphere(glm::vec3(0.0f, -100.5f, -1.0f), 100.0f, &sss));
-    scene.addObject(Sphere(glm::vec3(0.0f, -100.5f, -1.0f), 100.0f, &lambertian)); // Ground
-    // Add a light source
-    scene.addLight(Light(glm::vec3(5.0f, 5.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f)));
-    // Set up the camera
-    Camera camera;
-
-    // Render loop
-    while (!glfwWindowShouldClose(window)) {
-        // Process input (placeholder function)
-        float deltaTime = 0.01f; // Assume a fixed time step for simplicity
-        //processInput(window, camera);
-
-        // Render the scene
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        renderScene(camera, scene, WIDTH, HEIGHT, texture, NUM_SAMPLES, shaderProgram);
-
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
-
-    glDeleteTextures(1, &texture);
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    return 0;
 }

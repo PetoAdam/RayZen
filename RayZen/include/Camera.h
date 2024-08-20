@@ -2,42 +2,50 @@
 #define CAMERA_H
 
 #include <glm/glm.hpp>
-#include "Ray.h"
+#include <glm/gtc/matrix_transform.hpp>
 
 class Camera {
 public:
-    glm::vec3 origin;
-    glm::vec3 lower_left_corner;
-    glm::vec3 horizontal;
-    glm::vec3 vertical;
-    glm::vec3 u, v, w;
-    float zoom;
+    glm::vec3 position;
+    glm::vec3 target;
+    glm::vec3 up;
 
-    Camera() {
-        origin = glm::vec3(0.0f, 0.0f, 0.0f);
-        lower_left_corner = glm::vec3(-2.0f, -1.0f, -1.0f);
-        horizontal = glm::vec3(4.0f, 0.0f, 0.0f);
-        vertical = glm::vec3(0.0f, 2.0f, 0.0f);
-        zoom = 1.0f;
-        updateCameraVectors();
+    glm::mat4 viewMatrix;
+    glm::mat4 projectionMatrix;
+
+    float fov;  // Field of view
+    float aspectRatio;
+    float nearClip;
+    float farClip;
+
+    Camera(glm::vec3 position, glm::vec3 target, glm::vec3 up, float fov, float aspectRatio, float nearClip, float farClip)
+        : position(position), target(target), up(up), fov(fov), aspectRatio(aspectRatio), nearClip(nearClip), farClip(farClip) {
+        updateViewMatrix();
+        updateProjectionMatrix();
     }
 
-    Ray getRay(float u, float v) const {
-        return Ray(origin, lower_left_corner + u * horizontal + v * vertical - origin);
+    void updateViewMatrix() {
+        viewMatrix = glm::lookAt(position, target, up);
+    }
+
+    void updateProjectionMatrix() {
+        projectionMatrix = glm::perspective(glm::radians(fov), aspectRatio, nearClip, farClip);
+    }
+
+    void sendToShader(GLuint shaderProgram) const {
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, &viewMatrix[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, &projectionMatrix[0][0]);
+        glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, &position[0]);
     }
 
     void processMouseMovement(float xoffset, float yoffset) {
-        // Adjust the camera direction based on mouse movement
-        // Example implementation; adjust as needed
-    }
-
-    void updateCameraVectors() {
-        w = glm::normalize(origin - lower_left_corner);
-        u = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), w));
-        v = glm::cross(w, u);
-        horizontal = u * 4.0f * zoom;
-        vertical = v * 2.0f * zoom;
-        lower_left_corner = origin - horizontal / 2.0f - vertical / 2.0f - w;
+        // Example: simple yaw-pitch camera rotation (you can expand this)
+        glm::vec3 front = glm::normalize(target - position);
+        glm::vec3 right = glm::normalize(glm::cross(front, up));
+        //glm::vec3 rotatedFront = glm::rotate(front, glm::radians(xoffset), up);
+        //rotatedFront = glm::rotate(rotatedFront, glm::radians(yoffset), right);
+        //target = position + rotatedFront;
+        updateViewMatrix();
     }
 };
 
