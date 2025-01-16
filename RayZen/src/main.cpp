@@ -19,7 +19,7 @@ const unsigned int SCR_HEIGHT = 600;
 
 // Function prototypes
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
-void processInput(GLFWwindow* window);
+void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
 void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
@@ -27,6 +27,8 @@ void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 // Global variables
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
+float lastFrame = 0.0f;
+float deltaTime = 0.0f;
 
 int main() {
     // Initialize GLFW
@@ -56,6 +58,9 @@ int main() {
 
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glEnable(GL_DEPTH_TEST);
+
+    //glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);  // Hide the cursor when it's in the window
 
     // Load shaders
     shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
@@ -82,8 +87,8 @@ int main() {
 
     // Define spheres
     std::vector<Sphere> spheres = {
-        Sphere(glm::vec3(0.0f, 0.0f, -1.0f), 0.5f, 0),
-        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.2f, 1)
+        Sphere(glm::vec3(0.0f, 1.0f, -1.0f), 0.5f, 0),
+        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.5f, 1)
     };
 
     // Define lights
@@ -93,7 +98,12 @@ int main() {
 
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
-        processInput(window);
+
+        // Calculate delta time
+        float currentFrame = glfwGetTime();
+        deltaTime = currentFrame - lastFrame;
+        lastFrame = currentFrame;
+        processInput(window, camera, deltaTime);
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
@@ -121,9 +131,50 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
 }
 
-void processInput(GLFWwindow* window) {
+void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
+    
+    // Camera movement
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        camera.moveForward(deltaTime);
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        camera.moveBackward(deltaTime);
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        camera.moveLeft(deltaTime);
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        camera.moveRight(deltaTime);
+
+    // Apply mouse movement if the left mouse button is pressed
+    // Handle mouse rotation only when the left mouse button is pressed
+    static bool isDragging = false;
+    static double lastX = SCR_WIDTH / 2.0f;
+    static double lastY = SCR_HEIGHT / 2.0f;
+
+    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+        if (!isDragging) {
+            // Initialize lastX, lastY when the drag starts
+            glfwGetCursorPos(window, &lastX, &lastY);
+            isDragging = true;
+        }
+
+        // Only apply mouse movement while dragging
+        double mouseX, mouseY;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+
+        double offsetX = mouseX - lastX;
+        double offsetY = lastY - mouseY; // Y-coordinates are inverted in OpenGL
+
+        // Update rotation
+        camera.rotate(offsetX, offsetY);
+
+        // Update lastX and lastY for the next frame
+        lastX = mouseX;
+        lastY = mouseY;
+    } else {
+        // Reset dragging flag when mouse button is released
+        isDragging = false;
+    }
 }
 
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {

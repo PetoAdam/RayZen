@@ -122,15 +122,19 @@ void main() {
     Ray ray = calculateRay(uv);
 
     vec3 finalColor = vec3(0.0); // Default color
+    float closestT = 1.0e30; // Start with a very large distance (no intersection)
+
     for (int i = 0; i < 10; ++i) { // Loop over all spheres
         vec3 hitPoint, normal;
         int materialIndex;
+        float t = -1.0;
         if (hitSphere(spheres[i], ray, hitPoint, normal, materialIndex)) {
-            vec3 hitPoint, normal;
-            int materialIndex;
-            if (hitSphere(spheres[i], ray, hitPoint, normal, materialIndex)) {
+            t = length(hitPoint - ray.origin); // Compute the distance to the hit point
+
+            if (t < closestT) { // If this hit is closer than previous ones
+                closestT = t; // Update the closest hit distance
                 vec3 viewDir = normalize(camera.position - hitPoint);
-                finalColor = calculateLighting(hitPoint, normal, materials[materialIndex], viewDir);
+                finalColor = calculateLighting(hitPoint, normal, materials[materialIndex], viewDir); // Update the final color
             }
         }
     }
