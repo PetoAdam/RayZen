@@ -31,22 +31,6 @@ public:
     void updateProjectionMatrix() {
         projectionMatrix = glm::perspective(glm::radians(fov), aspectRatio, nearClip, farClip);
     }
-
-    void sendToShader(GLuint shaderProgram) const {
-        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, &viewMatrix[0][0]);
-        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, &projectionMatrix[0][0]);
-        glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, &position[0]);
-    }
-
-    void processMouseMovement(float xoffset, float yoffset) {
-        // Example: simple yaw-pitch camera rotation (you can expand this)
-        glm::vec3 front = glm::normalize(target - position);
-        glm::vec3 right = glm::normalize(glm::cross(front, up));
-        //glm::vec3 rotatedFront = glm::rotate(front, glm::radians(xoffset), up);
-        //rotatedFront = glm::rotate(rotatedFront, glm::radians(yoffset), right);
-        //target = position + rotatedFront;
-        updateViewMatrix();
-    }
 };
 
 #endif
