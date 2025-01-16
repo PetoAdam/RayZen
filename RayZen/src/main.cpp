@@ -81,20 +81,33 @@ int main() {
 
     // Define materials
     std::vector<Material> materials = {
-        Material(glm::vec3(0.8f, 0.3f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 32.0f, 0.1f, 0.0f, glm::vec3(0.8f, 0.3f, 0.3f)),
-        Material(glm::vec3(0.3f, 0.8f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.5f, 0.1f, glm::vec3(0.3f, 0.8f, 0.3f))
+        // Red matte material with slight reflectivity and refraction
+        Material(glm::vec3(0.8f, 0.3f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 32.0f, 0.1f, 0.0f, glm::vec3(0.8f, 0.3f, 0.3f), 0.8f, 0.0f, 1.5f),
+        // Green shiny material with more reflectivity and refraction
+        Material(glm::vec3(0.3f, 0.8f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.5f, 0.1f, glm::vec3(0.3f, 0.8f, 0.3f), 0.0f, 0.5f, 1.3f),
+        // Mirror-like material with high reflectivity and no transparency
+        Material(glm::vec3(1.0f, 1.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 1000.0f, 0.0f, 0.0f, glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 1.0f),
+        // Transparent material (like glass) with some reflectivity and refraction
+        Material(glm::vec3(0.0f, 0.8f, 1.0f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.0f, 0.2f, glm::vec3(0.0f, 0.8f, 1.0f), 0.0f, 0.8f, 1.5f),
+        // Rough surface material with low reflectivity and slight transparency
+        Material(glm::vec3(0.6f, 0.4f, 0.2f), glm::vec3(0.8f, 0.8f, 0.8f), 32.0f, 0.3f, 0.5f, glm::vec3(0.6f, 0.4f, 0.2f), 0.2f, 0.5f, 1.5f)
     };
 
     // Define spheres
     std::vector<Sphere> spheres = {
-        Sphere(glm::vec3(0.0f, 1.0f, -1.0f), 0.5f, 0),
-        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.5f, 1)
+        // First sphere (position, radius, material index)
+        Sphere(glm::vec3(0.0f, 1.0f, -1.0f), 0.5f, 0), // Red matte
+        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.5f, 1), // Green shiny
+        Sphere(glm::vec3(-1.5f, -0.5f, -2.0f), 0.7f, 2), // Mirror-like
+        Sphere(glm::vec3(2.0f, -1.0f, -3.0f), 0.6f, 3), // Transparent (glass)
+        Sphere(glm::vec3(0.5f, -1.5f, -2.5f), 0.5f, 4)  // Rough surface
     };
 
     // Define lights
     std::vector<Light> lights;
     lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f))); // Point light at (5, 5, 5)
     lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f))); // Directional light with direction (1, -1, 0)
+
 
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
@@ -256,6 +269,9 @@ void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std
         glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), materials[i].metallic);
         glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].fuzz").c_str()), materials[i].fuzz);
         glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(materials[i].albedo));
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].reflectivity").c_str()), materials[i].reflectivity);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].transparency").c_str()), materials[i].transparency);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].ior").c_str()), materials[i].ior);
     }
 
     // Send light data
