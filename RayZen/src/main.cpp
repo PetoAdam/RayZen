@@ -4,14 +4,15 @@
 #include <sstream>
 #include <string>
 
-#include "ShaderUtils.h"
-
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-// Shader compilation and linking error checking
+int WIDTH = 800;
+int HEIGHT = 600;
+
+// Function to check shader compilation and linking errors
 void checkCompileErrors(GLuint shader, const std::string& type) {
     GLint success;
     GLchar infoLog[1024];
@@ -30,36 +31,38 @@ void checkCompileErrors(GLuint shader, const std::string& type) {
     }
 }
 
-// Function to load shaders from files and compile them
+// Function to read file content into a string
+std::string readFile(const std::string& filePath) {
+    std::ifstream file(filePath);
+    std::stringstream fileStream;
+    fileStream << file.rdbuf();
+    return fileStream.str();
+}
+
+// Function to load and compile shaders
 GLuint loadShader(const std::string& vertexPath, const std::string& fragmentPath) {
-    // Read shader code from files
     std::string vertexCode = readFile(vertexPath);
     std::string fragmentCode = readFile(fragmentPath);
 
-    // Convert shader code to C-strings
     const char* vertexShaderCode = vertexCode.c_str();
     const char* fragmentShaderCode = fragmentCode.c_str();
 
-    // Compile vertex shader
     GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vertexShader, 1, &vertexShaderCode, nullptr);
     glCompileShader(vertexShader);
     checkCompileErrors(vertexShader, "VERTEX");
 
-    // Compile fragment shader
     GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragmentShader, 1, &fragmentShaderCode, nullptr);
     glCompileShader(fragmentShader);
     checkCompileErrors(fragmentShader, "FRAGMENT");
 
-    // Link shaders into a program
     GLuint shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertexShader);
     glAttachShader(shaderProgram, fragmentShader);
     glLinkProgram(shaderProgram);
     checkCompileErrors(shaderProgram, "PROGRAM");
 
-    // Clean up shaders after linking
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
 
@@ -73,16 +76,14 @@ int main() {
         return -1;
     }
 
-    // Create a windowed GLFW window and OpenGL context
-    GLFWwindow* window = glfwCreateWindow(800, 600, "OpenGL Shader Test", nullptr, nullptr);
+    // Create a windowed mode window and its OpenGL context
+    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "Path Tracing with Spheres", nullptr, nullptr);
     if (!window) {
-        std::cerr << "Window creation failed!" << std::endl;
+        std::cerr << "Failed to create GLFW window!" << std::endl;
         glfwTerminate();
         return -1;
     }
-
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
 
     // Initialize GLEW
     if (glewInit() != GLEW_OK) {
@@ -90,61 +91,74 @@ int main() {
         return -1;
     }
 
-    // Load the shaders from files
+    // Load shaders
     GLuint shaderProgram = loadShader("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
 
-    // Set up the vertex data (coordinates and color)
-    GLfloat vertices[] = {
-        // Positions          // Colors
-        -0.5f, -0.5f, 0.0f,   1.0f, 0.0f, 0.0f, // Bottom-left (red)
-         0.5f, -0.5f, 0.0f,   0.0f, 1.0f, 0.0f, // Bottom-right (green)
-         0.0f,  0.5f, 0.0f,   0.0f, 0.0f, 1.0f  // Top-center (blue)
+    // Set up a full-screen quad
+    GLfloat quadVertices[] = {
+        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
+        -1.0f,  1.0f, 0.0f, 0.0f, 1.0f
     };
+    GLuint quadIndices[] = { 0, 1, 2, 0, 2, 3 };
 
-    GLuint VBO, VAO;
+    GLuint VAO, VBO, EBO;
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
+    glGenBuffers(1, &EBO);
 
     glBindVertexArray(VAO);
 
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
 
-    // Position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (GLvoid*)0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quadIndices), quadIndices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)0);
     glEnableVertexAttribArray(0);
 
-    // Color attribute
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
     glEnableVertexAttribArray(1);
 
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
-    // Main render loop
+    // Uniform locations
+    GLuint resolutionLoc = glGetUniformLocation(shaderProgram, "u_resolution");
+    GLuint sphere1Loc = glGetUniformLocation(shaderProgram, "u_sphere1");
+    GLuint sphere2Loc = glGetUniformLocation(shaderProgram, "u_sphere2");
+
+    // Sphere data
+    glm::vec3 sphere1(0.3f, 0.3f, 0.2f);
+    glm::vec3 sphere2(-0.3f, -0.3f, 0.2f);
+
+    // Render loop
     while (!glfwWindowShouldClose(window)) {
-        // Clear the screen
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // Use the shader program
         glUseProgram(shaderProgram);
+        glUniform2f(resolutionLoc, static_cast<float>(width), static_cast<float>(height));
+        glUniform3f(sphere1Loc, sphere1.x, sphere1.y, sphere1.z);
+        glUniform3f(sphere2Loc, sphere2.x, sphere2.y, sphere2.z);
 
-        // Bind the VAO and draw the triangle
         glBindVertexArray(VAO);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
 
-        // Swap buffers and poll for events
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    // Clean up
+    // Cleanup
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
+    glDeleteBuffers(1, &EBO);
+    glDeleteProgram(shaderProgram);
 
-    // Terminate GLFW
     glfwTerminate();
-
     return 0;
 }
