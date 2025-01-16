@@ -1,10 +1,9 @@
 #version 330 core
-layout(location = 0) in vec2 aPos;
-layout(location = 1) in vec2 aTexCoord;
-
-out vec2 TexCoord;
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 color;
+out vec3 fragColor;
 
 void main() {
-    TexCoord = aTexCoord;
-    gl_Position = vec4(aPos, 0.0, 1.0);
+    fragColor = color; // Pass the color to the fragment shader
+    gl_Position = vec4(position, 1.0); // Transform the position to clip space
 }
