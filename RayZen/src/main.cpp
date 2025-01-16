@@ -6,161 +6,30 @@
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <float.h>
-#include <cmath>
 
 #include "Ray.h"
 #include "Sphere.h"
 #include "Scene.h"
 #include "Camera.h"
 #include "Material.h"
-#include "Light.h"
 
 // Constants
 const unsigned int SCR_WIDTH = 800;
 const unsigned int SCR_HEIGHT = 600;
-const int MAX_SPHERES = 10;
-const int MAX_MATERIALS = 10;
 
 // Function prototypes
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void setupFramebuffers(GLuint &framebufferA, GLuint &framebufferB, GLuint &textureA, GLuint &textureB, GLuint &rbo);
-void renderToFramebuffer(GLuint framebuffer, GLuint shaderProgram, GLuint quadVAO);
-void displayFramebuffer(GLuint texture, GLuint shaderProgram, GLuint quadVAO);
+void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights);
+void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 
 // Global variables
-GLuint framebufferA, framebufferB;
-GLuint textureA, textureB;
-GLuint rbo;
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
 
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials) {
-    glUseProgram(shaderProgram);
-
-    GLint viewMatrixLoc = glGetUniformLocation(shaderProgram, "camera.viewMatrix");
-    if (viewMatrixLoc == -1) std::cerr << "Uniform 'camera.viewMatrix' not found!" << std::endl;
-
-    GLint projMatrixLoc = glGetUniformLocation(shaderProgram, "camera.projectionMatrix");
-    if (projMatrixLoc == -1) std::cerr << "Uniform 'camera.projectionMatrix' not found!" << std::endl;
-
-    GLint camPosLoc = glGetUniformLocation(shaderProgram, "camera.position");
-    if (camPosLoc == -1) std::cerr << "Uniform 'camera.position' not found!" << std::endl;
-
-    glUniformMatrix4fv(viewMatrixLoc, 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
-    glUniformMatrix4fv(projMatrixLoc, 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
-    glUniform3fv(camPosLoc, 1, glm::value_ptr(camera.position));
-
-    GLint spheresLoc = glGetUniformLocation(shaderProgram, "spheres");
-    if (spheresLoc == -1) std::cerr << "Uniform 'spheres' not found!" << std::endl;
-    glUniform3fv(glGetUniformLocation(shaderProgram, "spheres[0].center"), spheres.size(), glm::value_ptr(spheres[0].center));
-    glUniform1fv(glGetUniformLocation(shaderProgram, "spheres[0].radius"), spheres.size(), &spheres[0].radius);
-    glUniform1iv(glGetUniformLocation(shaderProgram, "spheres[0].materialIndex"), spheres.size(), &spheres[0].materialIndex);
-    if(glGetUniformLocation(shaderProgram, "spheres[0].radius") == -1) std::cerr << "Materialindex not found" << std::endl;
-
-    GLint materialsLoc = glGetUniformLocation(shaderProgram, "materials");
-    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].diffuse"), materials.size(), glm::value_ptr(materials[0].diffuse));
-    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].specular"), materials.size(), glm::value_ptr(materials[0].specular));
-    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].shininess"), materials.size(), &materials[0].shininess);
-    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].metallic"), materials.size(), &materials[0].metallic);
-    glUniform1fv(glGetUniformLocation(shaderProgram, "materials[0].fuzz"), materials.size(), &materials[0].fuzz);
-    glUniform3fv(glGetUniformLocation(shaderProgram, "materials[0].albedo"), materials.size(), glm::value_ptr(materials[0].albedo));
-
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        std::cerr << "OpenGL Error: " << err << std::endl;
-    }
-}
-
-void setupQuad() {
-    GLfloat vertices[] = {
-        // Positions        // Texture Coords
-        -1.0f, -1.0f, 0.0f, 0.0f,
-         1.0f, -1.0f, 1.0f, 0.0f,
-         1.0f,  1.0f, 1.0f, 1.0f,
-        -1.0f,  1.0f, 0.0f, 1.0f
-    };
-
-    glGenVertexArrays(1, &quadVAO);
-    glGenBuffers(1, &quadVBO);
-
-    glBindVertexArray(quadVAO);
-
-    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (GLvoid*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (GLvoid*)(2 * sizeof(GLfloat)));
-    glEnableVertexAttribArray(1);
-
-    glBindVertexArray(0);
-}
-
-void setupFramebuffers(GLuint &framebufferA, GLuint &framebufferB, GLuint &textureA, GLuint &textureB, GLuint &rbo) {
-    glGenFramebuffers(1, &framebufferA);
-    glGenFramebuffers(1, &framebufferB);
-    glGenTextures(1, &textureA);
-    glGenTextures(1, &textureB);
-    glGenRenderbuffers(1, &rbo);
-
-    // Setup framebufferA
-    glBindFramebuffer(GL_FRAMEBUFFER, framebufferA);
-    glBindTexture(GL_TEXTURE_2D, textureA);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureA, 0);
-
-    // Setup framebufferB
-    glBindFramebuffer(GL_FRAMEBUFFER, framebufferB);
-    glBindTexture(GL_TEXTURE_2D, textureB);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, SCR_WIDTH, SCR_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureB, 0);
-
-    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, SCR_WIDTH, SCR_HEIGHT);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
-
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        std::cerr << "Framebuffer not complete!" << std::endl;
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind framebuffer
-}
-
-void renderToFramebuffer(GLuint framebuffer, GLuint shaderProgram, GLuint quadVAO) {
-    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glUseProgram(shaderProgram);
-    glBindVertexArray(quadVAO);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-    glBindVertexArray(0);
-}
-
-void displayFramebuffer(GLuint texture, GLuint shaderProgram, GLuint quadVAO) {
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glUseProgram(shaderProgram);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glBindVertexArray(quadVAO);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-    glBindVertexArray(0);
-}
-
 int main() {
+    // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
         return -1;
@@ -170,7 +39,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Ray Tracing", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Path Tracer", nullptr, nullptr);
     if (window == nullptr) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -178,7 +47,8 @@ int main() {
     }
     glfwMakeContextCurrent(window);
 
-    glewExperimental = true;
+    // Initialize GLEW
+    glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
         std::cerr << "Failed to initialize GLEW" << std::endl;
         return -1;
@@ -187,57 +57,58 @@ int main() {
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
+    // Load shaders
     shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
 
-    setupQuad();
-    setupFramebuffers(framebufferA, framebufferB, textureA, textureB, rbo);
+    // Setup quad for rendering
+    setupQuad(quadVAO, quadVBO);
 
+    // Define camera
     Camera camera(
-        glm::vec3(0.0f, 0.0f, 3.0f),
-        glm::vec3(0.0f, 0.0f, 0.0f),
-        glm::vec3(0.0f, 0.0f, 1.0f),
-        70.0f,
-        (float)SCR_WIDTH / (float)SCR_HEIGHT,
-        0.001f,
-        10000.0f
+        glm::vec3(0.0f, 0.0f, 3.0f), // Position
+        glm::vec3(0.0f, 0.0f, -1.0f), // Direction
+        glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
+        70.0f, // FOV
+        float(SCR_WIDTH) / float(SCR_HEIGHT), // Aspect ratio
+        0.1f, // Near plane
+        100.0f // Far plane
     );
 
+    // Define materials
     std::vector<Material> materials = {
         Material(glm::vec3(0.8f, 0.3f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 32.0f, 0.1f, 0.0f, glm::vec3(0.8f, 0.3f, 0.3f)),
-        //Material(glm::vec3(0.3f, 0.8f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.5f, 0.1f, glm::vec3(0.3f, 0.8f, 0.3f))
+        Material(glm::vec3(0.3f, 0.8f, 0.3f), glm::vec3(0.9f, 0.9f, 0.9f), 64.0f, 0.5f, 0.1f, glm::vec3(0.3f, 0.8f, 0.3f))
     };
 
+    // Define spheres
     std::vector<Sphere> spheres = {
         Sphere(glm::vec3(0.0f, 0.0f, -1.0f), 0.5f, 0),
-        //Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.2f, 1)
+        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.2f, 1)
     };
 
-    bool useFramebufferA = true;
+    // Define lights
+    std::vector<Light> lights;
+    lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f))); // Point light at (5, 5, 5)
+    lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f))); // Directional light with direction (1, -1, 0)
 
+    // Main render loop
     while (!glfwWindowShouldClose(window)) {
         processInput(window);
 
-        // Render to the framebuffer
-        GLuint currentFramebuffer = useFramebufferA ? framebufferA : framebufferB;
-        GLuint currentTexture = useFramebufferA ? textureA : textureB;
+        // Send scene data to the shader
+        sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
 
-        renderToFramebuffer(currentFramebuffer, shaderProgram, quadVAO);
-
-        // Display the result
-        displayFramebuffer(currentTexture, shaderProgram, quadVAO);
-
-        // Swap framebuffers
-        useFramebufferA = !useFramebufferA;
+        // Render the quad
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUseProgram(shaderProgram);
+        glBindVertexArray(quadVAO);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    glDeleteFramebuffers(1, &framebufferA);
-    glDeleteFramebuffers(1, &framebufferB);
-    glDeleteTextures(1, &textureA);
-    glDeleteTextures(1, &textureB);
-    glDeleteRenderbuffers(1, &rbo);
+    // Cleanup
     glDeleteVertexArrays(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
 
@@ -256,43 +127,50 @@ void processInput(GLFWwindow* window) {
 }
 
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
+    // Read vertex and fragment shader files
     std::ifstream vShaderFile(vertexPath);
     std::ifstream fShaderFile(fragmentPath);
     std::stringstream vShaderStream, fShaderStream;
+
     vShaderStream << vShaderFile.rdbuf();
     fShaderStream << fShaderFile.rdbuf();
+
     std::string vertexCode = vShaderStream.str();
     std::string fragmentCode = fShaderStream.str();
+
     const char* vShaderCode = vertexCode.c_str();
     const char* fShaderCode = fragmentCode.c_str();
 
+    // Compile vertex shader
     GLuint vertex = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex, 1, &vShaderCode, NULL);
+    glShaderSource(vertex, 1, &vShaderCode, nullptr);
     glCompileShader(vertex);
     int success;
     char infoLog[512];
     glGetShaderiv(vertex, GL_COMPILE_STATUS, &success);
     if (!success) {
-        glGetShaderInfoLog(vertex, 512, NULL, infoLog);
+        glGetShaderInfoLog(vertex, 512, nullptr, infoLog);
         std::cerr << "Vertex Shader Compilation Error: " << infoLog << std::endl;
     }
 
+    // Compile fragment shader
     GLuint fragment = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment, 1, &fShaderCode, NULL);
+    glShaderSource(fragment, 1, &fShaderCode, nullptr);
     glCompileShader(fragment);
     glGetShaderiv(fragment, GL_COMPILE_STATUS, &success);
     if (!success) {
-        glGetShaderInfoLog(fragment, 512, NULL, infoLog);
+        glGetShaderInfoLog(fragment, 512, nullptr, infoLog);
         std::cerr << "Fragment Shader Compilation Error: " << infoLog << std::endl;
     }
 
+    // Link shaders
     GLuint shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertex);
     glAttachShader(shaderProgram, fragment);
     glLinkProgram(shaderProgram);
     glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
     if (!success) {
-        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+        glGetProgramInfoLog(shaderProgram, 512, nullptr, infoLog);
         std::cerr << "Shader Program Linking Error: " << infoLog << std::endl;
     }
 
@@ -300,4 +178,60 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     glDeleteShader(fragment);
 
     return shaderProgram;
+}
+
+void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights) {
+    glUseProgram(shaderProgram);
+
+    // Send camera data
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
+    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(camera.position));
+
+    // Send spheres data
+    for (size_t i = 0; i < spheres.size(); ++i) {
+        std::string index = std::to_string(i);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].center").c_str()), 1, glm::value_ptr(spheres[i].center));
+        glUniform1f(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].radius").c_str()), spheres[i].radius);
+        glUniform1i(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].materialIndex").c_str()), spheres[i].materialIndex);
+    }
+
+    // Send materials data
+    for (size_t i = 0; i < materials.size(); ++i) {
+        std::string index = std::to_string(i);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].diffuse").c_str()), 1, glm::value_ptr(materials[i].diffuse));
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].specular").c_str()), 1, glm::value_ptr(materials[i].specular));
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].shininess").c_str()), materials[i].shininess);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), materials[i].metallic);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].fuzz").c_str()), materials[i].fuzz);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(materials[i].albedo));
+    }
+
+    // Send light data
+    for (size_t i = 0; i < lights.size(); ++i) {
+        std::string index = std::to_string(i);
+        glUniform4fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].positionOrDirection").c_str()), 1, glm::value_ptr(lights[i].positionOrDirection));
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].color").c_str()), 1, glm::value_ptr(lights[i].getColor()));
+    }
+}
+
+void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
+    float quadVertices[] = {
+        -1.0f,  1.0f, 0.0f,
+        -1.0f, -1.0f, 0.0f,
+         1.0f, -1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f
+    };
+
+    glGenVertexArrays(1, &quadVAO);
+    glGenBuffers(1, &quadVBO);
+    glBindVertexArray(quadVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), &quadVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glBindVertexArray(0);
 }
