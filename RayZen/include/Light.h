@@ -7,9 +7,10 @@ class Light {
 public:
     glm::vec4 positionOrDirection;  // Position for point lights, Direction for directional lights
     glm::vec3 color;  // Light color
+    float power;    // Power
 
-    Light(const glm::vec4& positionOrDirection, const glm::vec3& color)
-        : positionOrDirection(positionOrDirection), color(color) {}
+    Light(const glm::vec4& positionOrDirection, const glm::vec3& color, const float power)
+        : positionOrDirection(positionOrDirection), color(color), power(power) {}
 
     bool isPointLight() const {
         return positionOrDirection.w == 1.0f; // If w is 1.0, it's a point light
