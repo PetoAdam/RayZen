@@ -42,6 +42,24 @@ struct Ray {
     vec3 direction;
 };
 
+float rand(vec2 uv) {
+    return fract(sin(dot(uv.xy ,vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 randomHemisphereDirection(vec3 normal, vec2 seed) {
+    float u = rand(seed);
+    float v = rand(seed + vec2(1.0, 1.0));
+    float theta = acos(sqrt(1.0 - u));
+    float phi = 2.0 * 3.14159 * v;
+    
+    vec3 dir = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+    vec3 up = abs(normal.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+    
+    return normalize(tangent * dir.x + bitangent * dir.y + normal * dir.z);
+}
+
 Ray calculateRay(vec2 uv) {
     vec4 ray_clip = vec4(uv * 2.0 - 1.0, -1.0, 1.0);
     vec4 ray_eye = inverse(camera.projectionMatrix) * ray_clip;
@@ -149,48 +167,58 @@ void main() {
     Ray ray = calculateRay(uv);
 
     vec3 color = vec3(0.0);
-    vec3 currentRayOrigin = ray.origin;
-    vec3 currentRayDirection = ray.direction;
 
     int maxBounces = 5;
-    for (int bounce = 0; bounce < maxBounces; ++bounce) {
-        vec3 hitPoint, normal;
-        int materialIndex = -1;
-        float closestT = 1.0e30;
-        Material closestMaterial;
+    int numSamples = 10;
 
-        for (int i = 0; i < 10; ++i) {
-            vec3 tempHitPoint, tempNormal;
-            int tempMaterialIndex = -1;
-            if (hitSphere(spheres[i], Ray(currentRayOrigin, currentRayDirection), tempHitPoint, tempNormal, tempMaterialIndex)) {
-                float t = length(tempHitPoint - currentRayOrigin);
-                if (t < closestT) {
-                    closestT = t;
-                    hitPoint = tempHitPoint;
-                    normal = tempNormal;
-                    materialIndex = tempMaterialIndex;
-                    closestMaterial = materials[materialIndex];
+    for (int sample = 0; sample < numSamples; ++sample) {
+        vec3 currentRayOrigin = ray.origin;
+        vec3 currentRayDirection = ray.direction;
+        vec3 throughput = vec3(1.0);
+
+        for (int bounce = 0; bounce < maxBounces; ++bounce) {
+            vec3 hitPoint, normal;
+            int materialIndex = -1;
+            float closestT = 1.0e30;
+            Material closestMaterial;
+
+            for (int i = 0; i < 10; ++i) {
+                vec3 tempHitPoint, tempNormal;
+                int tempMaterialIndex = -1;
+                if (hitSphere(spheres[i], Ray(currentRayOrigin, currentRayDirection), tempHitPoint, tempNormal, tempMaterialIndex)) {
+                    float t = length(tempHitPoint - currentRayOrigin);
+                    if (t < closestT) {
+                        closestT = t;
+                        hitPoint = tempHitPoint;
+                        normal = tempNormal;
+                        materialIndex = tempMaterialIndex;
+                        closestMaterial = materials[materialIndex];
+                    }
                 }
             }
-        }
 
-        if (materialIndex == -1) break;
+            if (materialIndex == -1) break;
 
-        vec3 viewDir = normalize(camera.position - hitPoint);
-        color += calculateLighting(hitPoint, normal, closestMaterial, viewDir);
+            vec3 viewDir = normalize(camera.position - hitPoint);
+            color += throughput * calculateLighting(hitPoint, normal, closestMaterial, viewDir);
 
-        // Reflection and refraction
-        if (closestMaterial.reflectivity > 0.0) {
-            currentRayDirection = reflectRay(currentRayDirection, normal);
-            currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
-        } else if (closestMaterial.transparency > 0.0) {
-            currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
-            currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
-        } else {
-            break; // No further bounces for opaque surfaces
+            // Reflection and refraction
+            if (closestMaterial.reflectivity > 0.0) {
+                currentRayDirection = reflectRay(currentRayDirection, normal);
+                currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
+                throughput *= closestMaterial.reflectivity;
+            } else if (closestMaterial.transparency > 0.0) {
+                currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
+                currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
+                throughput *= closestMaterial.transparency;
+            } else {
+                currentRayDirection = randomHemisphereDirection(normal, uv + vec2(float(sample), float(bounce)));
+                currentRayOrigin = hitPoint + currentRayDirection * 0.001;
+                throughput *= closestMaterial.albedo;
+            }
         }
     }
-
+    color = color / float(numSamples);
     FragColor = vec4(color, 1.0);
 
 }

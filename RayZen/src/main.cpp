@@ -88,7 +88,7 @@ int main() {
         // Mirror-like material (fully reflective, smooth)
         Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.1f, 1.0f, 0.0f, 1.5f),
         // Glass-like material (transparent, smooth)
-        Material(glm::vec3(0.9f, 0.9f, 1.0f), 0.0f, 0.1f, 0.1f, 0.8f, 1.5f),
+        Material(glm::vec3(0.9f, 0.9f, 1.0f), 0.0f, 0.1f, 0.0f, 0.8f, 1.5f),
         // Rough surface material (non-metallic, rough)
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
@@ -101,6 +101,7 @@ int main() {
         Sphere(glm::vec3(-1.5f, -0.5f, -2.0f), 0.7f, 2), // Mirror-like
         Sphere(glm::vec3(2.0f, -1.0f, -3.0f), 0.6f, 3), // Transparent (glass)
         Sphere(glm::vec3(0.5f, -1.5f, -2.5f), 0.5f, 4),  // Rough surface
+        Sphere(glm::vec3(0.0f, 0.0f, -15.0f), 10.0f, 0),  // Rough surface
     };
 
     // Define lights
