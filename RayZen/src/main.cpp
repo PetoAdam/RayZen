@@ -82,13 +82,13 @@ int main() {
     // Define materials
     std::vector<Material> materials = {
         // Red matte material (non-metallic, rough)
-        Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 0.8f, 0.0f, 0.0f, 1.5f),
+        Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
         // Green metallic material (metallic, smooth)
-        Material(glm::vec3(0.3f, 0.8f, 0.3f), 1.0f, 0.2f, 0.5f, 0.0f, 1.5f),
+        Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.2f, 0.5f, 0.0f, 1.5f),
         // Mirror-like material (fully reflective, smooth)
         Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.1f, 1.0f, 0.0f, 1.5f),
         // Glass-like material (transparent, smooth)
-        Material(glm::vec3(0.9f, 0.9f, 1.0f), 0.0f, 0.1f, 0.0f, 0.8f, 1.5f),
+        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.9f, 1.5f),
         // Rough surface material (non-metallic, rough)
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
@@ -106,7 +106,7 @@ int main() {
 
     // Define lights
     std::vector<Light> lights;
-    lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 30.0f)); // Point light at (5, 5, 5)
+    lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (1, -1, 0)
 
 

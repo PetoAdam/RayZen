@@ -35,7 +35,7 @@ uniform Light lights[10];
 out vec4 FragColor;
 
 // Ambient light
-const vec3 ambientLightColor = vec3(0.1, 0.1, 0.1);
+const vec3 ambientLightColor = vec3(0.05, 0.05, 0.05);
 
 struct Ray {
     vec3 origin;
@@ -60,7 +60,9 @@ vec3 randomHemisphereDirection(vec3 normal, vec2 seed) {
     return normalize(tangent * dir.x + bitangent * dir.y + normal * dir.z);
 }
 
-Ray calculateRay(vec2 uv) {
+Ray calculateRay(vec2 uv, vec2 seed) {
+    vec2 jitter = vec2(rand(seed), rand(seed + vec2(1.0, 1.0))) * 0.002;
+    uv += jitter;
     vec4 ray_clip = vec4(uv * 2.0 - 1.0, -1.0, 1.0);
     vec4 ray_eye = inverse(camera.projectionMatrix) * ray_clip;
     ray_eye = vec4(ray_eye.xy, -1.0, 0.0);
@@ -91,6 +93,28 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
+// TODO: Check if hit object is transparent
+bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance) {
+    for (int i = 0; i < 10; ++i) {
+        Sphere sphere = spheres[i];
+        vec3 oc = hitPoint - sphere.center;
+        float a = dot(lightDir, lightDir);
+        float b = 2.0 * dot(oc, lightDir);
+        float c = dot(oc, oc) - sphere.radius * sphere.radius;
+        float discriminant = b * b - 4.0 * a * c;
+
+        if (discriminant > 0.0) {
+            float t = (-b - sqrt(discriminant)) / (2.0 * a);
+            if (t > 0.001 && t < maxDistance) { // Check for intersection within range
+                if(materials[sphere.materialIndex].transparency < 0.7){
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewDir) {
     vec3 F0 = mix(vec3(0.04), material.albedo, material.metallic);
     vec3 finalColor = ambientLightColor * material.albedo;
@@ -100,14 +124,24 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         vec3 lightDir;
         float attenuation = 1.0;
 
-        if (light.positionOrDirection.w == 1.0) { // Point light
+         if (light.positionOrDirection.w == 1.0) { // Point light
             vec3 lightVec = light.positionOrDirection.xyz - hitPoint;
             float distance = max(length(lightVec), 0.001);
             lightDir = normalize(lightVec);
             attenuation = light.power / (distance * distance);
+
+            // Check shadows for point lights
+            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, distance)) {
+                continue; // Skip this light if the point is in shadow
+            }
         } else { // Directional light
             lightDir = normalize(light.positionOrDirection.xyz);
             attenuation = light.power;
+
+            // Check shadows for directional lights
+            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, 1e30)) {
+                continue; // Skip this light if the point is in shadow
+            }
         }
 
         vec3 halfwayDir = normalize(lightDir + viewDir);
@@ -164,19 +198,21 @@ vec3 refractRay(vec3 incident, vec3 normal, float ior) {
 
 void main() {
     vec2 uv = gl_FragCoord.xy / vec2(800.0, 600.0);
-    Ray ray = calculateRay(uv);
+    vec2 seed;
 
     vec3 color = vec3(0.0);
-
     int maxBounces = 5;
-    int numSamples = 10;
-
+    int numSamples = 100;
+    
     for (int sample = 0; sample < numSamples; ++sample) {
+        seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);
+        Ray ray = calculateRay(uv, seed);
         vec3 currentRayOrigin = ray.origin;
         vec3 currentRayDirection = ray.direction;
         vec3 throughput = vec3(1.0);
 
         for (int bounce = 0; bounce < maxBounces; ++bounce) {
+            seed = seed * bounce * bounce * 12793.46 + bounce * 1423.34;
             vec3 hitPoint, normal;
             int materialIndex = -1;
             float closestT = 1.0e30;
@@ -198,27 +234,23 @@ void main() {
             }
 
             if (materialIndex == -1) break;
-
             vec3 viewDir = normalize(camera.position - hitPoint);
             color += throughput * calculateLighting(hitPoint, normal, closestMaterial, viewDir);
 
-            // Reflection and refraction
-            if (closestMaterial.reflectivity > 0.0) {
+            float randVal = rand(seed + vec2(float(sample), float(bounce)));
+            if (randVal < closestMaterial.reflectivity) {
                 currentRayDirection = reflectRay(currentRayDirection, normal);
-                currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
-                throughput *= closestMaterial.reflectivity;
-            } else if (closestMaterial.transparency > 0.0) {
+            } else if (randVal < (closestMaterial.reflectivity + closestMaterial.transparency)) {
                 currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
-                currentRayOrigin = hitPoint + currentRayDirection * 0.001; // Offset to avoid self-intersection
-                throughput *= closestMaterial.transparency;
             } else {
-                currentRayDirection = randomHemisphereDirection(normal, uv + vec2(float(sample), float(bounce)));
-                currentRayOrigin = hitPoint + currentRayDirection * 0.001;
-                throughput *= closestMaterial.albedo;
+                currentRayDirection = randomHemisphereDirection(normal, seed);
+                throughput *= 0.05;
             }
+            currentRayOrigin = hitPoint + currentRayDirection * 0.001;
+            throughput *= closestMaterial.albedo;
         }
     }
     color = color / float(numSamples);
+    color = clamp(color, 0.0, 1.0);
     FragColor = vec4(color, 1.0);
-
 }
