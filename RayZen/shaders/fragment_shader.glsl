@@ -201,8 +201,8 @@ void main() {
     vec2 seed;
 
     vec3 color = vec3(0.0);
-    int maxBounces = 5;
-    int numSamples = 100;
+    int maxBounces = 4;
+    int numSamples = 15;
     
     for (int sample = 0; sample < numSamples; ++sample) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);

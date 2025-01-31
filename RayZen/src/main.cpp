@@ -119,6 +119,9 @@ int main() {
         lastFrame = currentFrame;
         processInput(window, camera, deltaTime);
 
+        // Print fps
+        std::clog << 1.0/deltaTime << std::endl;
+
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
 
