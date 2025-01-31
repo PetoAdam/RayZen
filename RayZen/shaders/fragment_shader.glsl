@@ -196,45 +196,9 @@ vec3 refractRay(vec3 incident, vec3 normal, float ior) {
     return (k < 0.0) ? vec3(0.0) : eta * incident + (eta * cosi - sqrt(k)) * n;
 }
 
-void renderLights() {
-    for (int i = 0; i < 10; ++i) {
-        Light light = lights[i];
-        
-        // Transform light position to camera space
-        vec4 lightViewPos = camera.viewMatrix * light.positionOrDirection;
-        
-        // Project the light position onto screen space
-        vec4 lightClipPos = camera.projectionMatrix * lightViewPos;
-        vec3 lightScreenPos = lightClipPos.xyz / lightClipPos.w;
-
-        // Map from [-1, 1] to [0, 1] range for screen space
-        vec2 lightNormalizedPos = (lightScreenPos.xy + 1.0) / 2.0;
-        
-        // Scale the light's position to pixel coordinates
-        vec2 screenSize = vec2(800.0, 600.0); // Use your actual screen resolution
-        vec2 lightPixelPos = lightNormalizedPos * screenSize;
-
-        // Draw a small circle at the light position
-        float lightSize = 30.0; // Radius of the light representation in pixels
-        float dist = length(gl_FragCoord.xy - lightPixelPos);
-
-        // If we're within the radius of the light's position, render it
-        if (dist < lightSize) {
-            FragColor = vec4(light.color, 1.0); // Color of the light
-            return; // Output light color and stop further processing
-        }
-    }
-}
-
-
 void main() {
     vec2 uv = gl_FragCoord.xy / vec2(800.0, 600.0);
     vec2 seed;
-
-    FragColor = vec4(0.0);
-
-    // Render light positions onto the screen
-    renderLights();
 
     vec3 color = vec3(0.0);
     int maxBounces = 4;
@@ -288,5 +252,5 @@ void main() {
     }
     color = color / float(numSamples);
     color = clamp(color, 0.0, 1.0);
-    FragColor += vec4(color, 1.0);
+    FragColor = vec4(color, 1.0);
 }
