@@ -212,7 +212,7 @@ void main() {
         vec3 throughput = vec3(1.0);
 
         for (int bounce = 0; bounce < maxBounces; ++bounce) {
-            seed = seed * bounce * bounce * 12793.46 + bounce * 1423.34;
+            vec2 tempseed = seed * bounce * bounce * 12793.46 + bounce * 1423.34;
             vec3 hitPoint, normal;
             int materialIndex = -1;
             float closestT = 1.0e30;
@@ -237,13 +237,13 @@ void main() {
             vec3 viewDir = normalize(camera.position - hitPoint);
             color += throughput * calculateLighting(hitPoint, normal, closestMaterial, viewDir);
 
-            float randVal = rand(seed + vec2(float(sample), float(bounce)));
+            float randVal = rand(tempseed + vec2(float(sample), float(bounce)));
             if (randVal < closestMaterial.reflectivity) {
                 currentRayDirection = reflectRay(currentRayDirection, normal);
             } else if (randVal < (closestMaterial.reflectivity + closestMaterial.transparency)) {
                 currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
             } else {
-                currentRayDirection = randomHemisphereDirection(normal, seed);
+                currentRayDirection = randomHemisphereDirection(normal, tempseed);
                 throughput *= 0.05;
             }
             currentRayOrigin = hitPoint + currentRayDirection * 0.001;
