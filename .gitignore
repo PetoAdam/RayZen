@@ -6,6 +6,8 @@
 *.lo
 *.o
 *.obj
+# Keep cube.obj
+!RayZen/meshes/cube.obj
 
 # Precompiled Headers
 *.gch

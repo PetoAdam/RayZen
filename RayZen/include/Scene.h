@@ -3,16 +3,16 @@
 
 #include <vector>
 #include "Ray.h"
-#include "Sphere.h"
+#include "Mesh.h"
 #include "Light.h"
 #include "HitRecord.h"
 
 class Scene {
 public:
-    std::vector<Sphere> objects;
+    std::vector<Mesh> objects;
     std::vector<Light> lights;
 
-    void addObject(const Sphere& obj) {
+    void addObject(const Mesh& obj) {
         objects.push_back(obj);
     }
 

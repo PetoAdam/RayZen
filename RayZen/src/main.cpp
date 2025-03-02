@@ -8,10 +8,10 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include "Ray.h"
-#include "Sphere.h"
 #include "Scene.h"
 #include "Camera.h"
 #include "Material.h"
+#include "Mesh.h"
 
 // Constants
 unsigned int SCR_WIDTH = 800;
@@ -21,7 +21,8 @@ unsigned int SCR_HEIGHT = 600;
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights);
+void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Material>& materials, const std::vector<Light>& lights);
+void sendMeshDataToShader(GLuint shaderProgram, const Mesh& mesh);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 
 // Global variables
@@ -93,16 +94,11 @@ int main() {
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
 
-    // Define spheres
-    std::vector<Sphere> spheres = {
-        // First sphere (position, radius, material index)
-        Sphere(glm::vec3(0.0f, 1.0f, -1.0f), 0.5f, 0), // Red matte
-        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.5f, 1), // Green shiny
-        Sphere(glm::vec3(-1.5f, -0.5f, -2.0f), 0.7f, 2), // Mirror-like
-        Sphere(glm::vec3(2.0f, -1.0f, -3.0f), 0.6f, 3), // Transparent (glass)
-        Sphere(glm::vec3(0.5f, -1.5f, -2.5f), 0.5f, 4),  // Rough surface
-        Sphere(glm::vec3(0.0f, 0.0f, -15.0f), 10.0f, 0),  // Rough surface
-    };
+    Mesh mesh;
+    if (!mesh.loadFromOBJ("../meshes/cube.obj", /*materialIndex=*/1)) {
+        std::cerr << "Failed to load mesh!" << std::endl;
+        return -1;
+    }
 
     // Define lights
     std::vector<Light> lights;
@@ -127,7 +123,8 @@ int main() {
         camera.updateProjectionMatrix();
 
         // Send scene data to the shader
-        sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
+        sendSceneDataToShader(shaderProgram, camera, materials, lights);
+        sendMeshDataToShader(shaderProgram, mesh);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -254,7 +251,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     return shaderProgram;
 }
 
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights) {
+void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Material>& materials, const std::vector<Light>& lights) {
     glUseProgram(shaderProgram);
 
     // Send resolution uniform
@@ -264,14 +261,6 @@ void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
     glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(camera.position));
-
-    // Send spheres data
-    for (size_t i = 0; i < spheres.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].center").c_str()), 1, glm::value_ptr(spheres[i].center));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].radius").c_str()), spheres[i].radius);
-        glUniform1i(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].materialIndex").c_str()), spheres[i].materialIndex);
-    }
 
     // Send materials data
     for (size_t i = 0; i < materials.size(); ++i) {
@@ -292,6 +281,27 @@ void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std
         glUniform1f(glGetUniformLocation(shaderProgram, ("lights[" + index + "].power").c_str()), lights[i].power);
     }
 }
+
+// Pass the triangles to the shader as a uniform array.
+void sendMeshDataToShader(GLuint shaderProgram, const Mesh& mesh) {
+    glUseProgram(shaderProgram);
+    
+    // Here we assume you won’t have more than, say, 100 triangles.
+    // Update the shader uniform “numTriangles”.
+    int numTriangles = mesh.triangles.size();
+    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), numTriangles);
+    
+    // For each triangle, send the vertices and material index.
+    // For simplicity, assume the shader has an array "triangles[100]" of type Triangle.
+    for (int i = 0; i < numTriangles; ++i) {
+        std::string idx = std::to_string(i);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v0").c_str()), 1, &mesh.triangles[i].v0[0]);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v1").c_str()), 1, &mesh.triangles[i].v1[0]);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v2").c_str()), 1, &mesh.triangles[i].v2[0]);
+        glUniform1i(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].materialIndex").c_str()), mesh.triangles[i].materialIndex);
+    }
+}
+
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
     float quadVertices[] = {
