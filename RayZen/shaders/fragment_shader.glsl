@@ -1,5 +1,7 @@
 #version 330 core
 
+uniform vec2 resolution;
+
 struct Camera {
     mat4 viewMatrix;
     mat4 projectionMatrix;
@@ -93,8 +95,8 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
-// TODO: Check if hit object is transparent
-bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance) {
+bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance, out float shadowAttenuation) {
+    shadowAttenuation = 1.0;
     for (int i = 0; i < 10; ++i) {
         Sphere sphere = spheres[i];
         vec3 oc = hitPoint - sphere.center;
@@ -105,10 +107,13 @@ bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance) {
 
         if (discriminant > 0.0) {
             float t = (-b - sqrt(discriminant)) / (2.0 * a);
-            if (t > 0.001 && t < maxDistance) { // Check for intersection within range
-                if(materials[sphere.materialIndex].transparency < 0.7){
+            if (t > 0.001 && t < maxDistance) {
+                float transparency = materials[sphere.materialIndex].transparency;
+                // Multiply shadow attenuation by the object's transparency.
+                shadowAttenuation *= transparency;
+                // Early out if nearly opaque.
+                if(shadowAttenuation < 0.05)
                     return true;
-                }
             }
         }
     }
@@ -123,6 +128,7 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         Light light = lights[i];
         vec3 lightDir;
         float attenuation = 1.0;
+        float shadowAttenuation;
 
          if (light.positionOrDirection.w == 1.0) { // Point light
             vec3 lightVec = light.positionOrDirection.xyz - hitPoint;
@@ -131,7 +137,7 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
             attenuation = light.power / (distance * distance);
 
             // Check shadows for point lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, distance)) {
+            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, distance, shadowAttenuation)) {
                 continue; // Skip this light if the point is in shadow
             }
         } else { // Directional light
@@ -139,10 +145,11 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
             attenuation = light.power;
 
             // Check shadows for directional lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, 1e30)) {
+            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, 1e30, shadowAttenuation)) {
                 continue; // Skip this light if the point is in shadow
             }
         }
+        attenuation *= shadowAttenuation;
 
         vec3 halfwayDir = normalize(lightDir + viewDir);
         float NdotL = max(dot(normal, lightDir), 0.0);
@@ -193,16 +200,17 @@ vec3 refractRay(vec3 incident, vec3 normal, float ior) {
     }
     float eta = etai / etat;
     float k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-    return (k < 0.0) ? vec3(0.0) : eta * incident + (eta * cosi - sqrt(k)) * n;
+    // Check for total internal reflection
+    return (k < 0.0) ? reflectRay(incident, normal) : eta * incident + (eta * cosi - sqrt(k)) * n;
 }
 
 void main() {
-    vec2 uv = gl_FragCoord.xy / vec2(800.0, 600.0);
+    vec2 uv = gl_FragCoord.xy / resolution;
     vec2 seed;
 
     vec3 color = vec3(0.0);
-    int maxBounces = 4;
-    int numSamples = 15;
+    int maxBounces = 5;
+    int numSamples = 30;
     
     for (int sample = 0; sample < numSamples; ++sample) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);
@@ -238,16 +246,43 @@ void main() {
             color += throughput * calculateLighting(hitPoint, normal, closestMaterial, viewDir);
 
             float randVal = rand(tempseed + vec2(float(sample), float(bounce)));
-            if (randVal < closestMaterial.reflectivity) {
-                currentRayDirection = reflectRay(currentRayDirection, normal);
-            } else if (randVal < (closestMaterial.reflectivity + closestMaterial.transparency)) {
-                currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
+
+            // If the material is transparent, use Fresnel to mix reflection and refraction
+            if (closestMaterial.transparency > 0.0) {
+                // Compute the cosine of the incident angle
+                float cosi = clamp(dot(-currentRayDirection, normal), 0.0, 1.0);
+                // Calculate base reflectivity for dielectrics (using IOR)
+                float F0 = pow((1.0 - closestMaterial.ior) / (1.0 + closestMaterial.ior), 2.0);
+                vec3 F0vec = vec3(F0);
+                // Compute Fresnel reflectance via Schlick's approximation
+                vec3 F = fresnelSchlick(cosi, F0vec);
+                float fresnelProbability = clamp(F.r, 0.0, 1.0); // Use one channel as the probability
+
+                // Choose reflection vs. refraction based on Fresnel probability.
+                if (randVal < fresnelProbability) {
+                    currentRayDirection = reflectRay(currentRayDirection, normal);
+                } else {
+                    currentRayDirection = refractRay(currentRayDirection, normal, closestMaterial.ior);
+                }
             } else {
-                currentRayDirection = randomHemisphereDirection(normal, tempseed);
-                throughput *= 0.05;
+                // For opaque materials: mix reflection with diffuse scattering
+                if (randVal < closestMaterial.reflectivity) {
+                    currentRayDirection = reflectRay(currentRayDirection, normal);
+                } else {
+                    currentRayDirection = randomHemisphereDirection(normal, tempseed);
+                    throughput *= 0.05;
+                }
             }
             currentRayOrigin = hitPoint + currentRayDirection * 0.001;
             throughput *= closestMaterial.albedo;
+
+            // Russian roulette termination
+            if(bounce > 2) { // Start terminating after a couple of bounces
+                float p = max(throughput.r, max(throughput.g, throughput.b));
+                if(rand(tempseed + vec2(float(sample), float(bounce))) > p)
+                    break;
+                throughput /= p;
+            }
         }
     }
     color = color / float(numSamples);

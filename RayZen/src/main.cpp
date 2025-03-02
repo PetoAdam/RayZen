@@ -14,8 +14,8 @@
 #include "Material.h"
 
 // Constants
-const unsigned int SCR_WIDTH = 800;
-const unsigned int SCR_HEIGHT = 600;
+unsigned int SCR_WIDTH = 800;
+unsigned int SCR_HEIGHT = 600;
 
 // Function prototypes
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
@@ -120,7 +120,11 @@ int main() {
         processInput(window, camera, deltaTime);
 
         // Print fps
-        std::clog << 1.0/deltaTime << std::endl;
+        //std::clog << 1.0/deltaTime << std::endl;
+
+        // Update camera aspect ratio and projection matrix each frame
+        camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
+        camera.updateProjectionMatrix();
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
@@ -145,6 +149,8 @@ int main() {
 }
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    SCR_WIDTH = width;
+    SCR_HEIGHT = height;
     glViewport(0, 0, width, height);
 }
 
@@ -250,6 +256,9 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
 
 void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights) {
     glUseProgram(shaderProgram);
+
+    // Send resolution uniform
+    glUniform2f(glGetUniformLocation(shaderProgram, "resolution"), float(SCR_WIDTH), float(SCR_HEIGHT));
 
     // Send camera data
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
