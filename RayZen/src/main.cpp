@@ -92,7 +92,7 @@ int main() {
         // Mirror-like material (fully reflective, smooth)
         Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.1f, 1.0f, 0.0f, 1.5f),
         // Glass-like material (transparent, smooth)
-        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.9f, 1.5f),
+        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.99f, 1.5f),
         // Rough surface material (non-metallic, rough)
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
@@ -122,7 +122,7 @@ int main() {
     }
 
     Mesh cube4;
-    if (cube4.loadFromOBJ("../meshes/cube.obj", 4)) {
+    if (cube4.loadFromOBJ("../meshes/cube.obj", 3)) {
         cube4.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.0f, 3.0f, 0.0f)) *
                         glm::scale(glm::mat4(1.0f), glm::vec3(1.0f));
         scene.meshes.push_back(cube4);
@@ -130,7 +130,7 @@ int main() {
 
     // Define lights
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
-    scene.lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (1, -1, 0)
+    scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
 
 
     // Main render loop

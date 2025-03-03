@@ -275,10 +275,10 @@ void main() {
                 vec3 F = fresnelSchlick(cosi, F0vec);
                 float fresnelProbability = clamp(F.r, 0.0, 1.0);
 
-                if (randVal < fresnelProbability) {
+                if (false /*randVal < fresnelProbability * hitMaterial.transparency*/) {
                     currentDirection = reflectRay(currentDirection, hitNormal);
                 } else {
-                    currentDirection = refractRay(currentDirection, hitNormal, hitMaterial.ior);
+                    //currentDirection = refractRay(currentDirection, hitNormal, hitMaterial.ior);
                 }
             } else {
                 // For opaque materials: choose between reflection and diffuse scattering.
