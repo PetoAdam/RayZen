@@ -1,4 +1,4 @@
-#version 330 core
+#version 430 core
 
 // Uniforms
 uniform vec2 resolution;
@@ -20,25 +20,36 @@ struct Material {
     float transparency;
     float ior;
 };
-uniform Material materials[10];
 
 struct Light {
     vec4 positionOrDirection; // w==1.0 for point lights, w==0.0 for directional lights
     vec3 color;
     float power;
 };
-uniform Light lights[10];
 
 struct Triangle {
     vec3 v0;
+    float pad0; // Padding to align to 16 bytes
     vec3 v1;
+    float pad1; // Padding to align to 16 bytes
     vec3 v2;
+    float pad2; // Padding to align to 16 bytes
     int materialIndex;
 };
 
-#define MAX_TRIANGLES 100
+layout(std430, binding = 0) buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 1) buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 2) buffer LightBuffer {
+    Light lights[];
+};
+
 uniform int numTriangles;
-uniform Triangle triangles[MAX_TRIANGLES];
 
 out vec4 FragColor;
 
@@ -229,8 +240,8 @@ void main() {
     int maxBounces = 4;
     int numSamples = 5;
 
-    for (int sample = 0; sample < numSamples; ++sample) {
-        seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);
+    for (int samp = 0; samp < numSamples; ++samp) {
+        seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + samp + 1.0);
         Ray ray = calculateRay(uv, seed);
         vec3 currentOrigin = ray.origin;
         vec3 currentDirection = ray.direction;
@@ -265,7 +276,7 @@ void main() {
             vec3 viewDir = normalize(camera.position - hitPoint);
             color += throughput * calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
 
-            float randVal = rand(tempseed + vec2(float(sample), float(bounce)));
+            float randVal = rand(tempseed + vec2(float(samp), float(bounce)));
 
             // Transparent material: mix reflection and refraction
             if (hitMaterial.transparency > 0.0) {
@@ -273,12 +284,11 @@ void main() {
                 float F0 = pow((1.0 - hitMaterial.ior) / (1.0 + hitMaterial.ior), 2.0);
                 vec3 F0vec = vec3(F0);
                 vec3 F = fresnelSchlick(cosi, F0vec);
-                float fresnelProbability = clamp(normalize(F.r), 0.0, 1.0);
+                float fresnelProbability = clamp(F.r, 0.0, 1.0);
 
                 //TODO: Check other option?
                 if (randVal > hitMaterial.transparency /*randVal < fresnelProbability * hitMaterial.transparency*/) {
                     currentDirection = reflectRay(currentDirection, hitNormal);
-
                 } else {
                     //currentDirection = refractRay(currentDirection, hitNormal, hitMaterial.ior);
                 }
@@ -297,7 +307,7 @@ void main() {
             // Russian roulette termination after a few bounces
             if (bounce > 2) {
                 float p = max(throughput.r, max(throughput.g, throughput.b));
-                if (rand(tempseed + vec2(float(sample), float(bounce))) > p)
+                if (rand(tempseed + vec2(float(samp), float(bounce))) > p)
                     break;
                 throughput /= p;
             }

@@ -24,10 +24,12 @@ void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
+void initializeSSBOs(const Scene& scene);
 
 // Global variables
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
+GLuint triangleSSBO, materialSSBO, lightSSBO;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
 
@@ -132,6 +134,8 @@ int main() {
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
 
+    // Initialize SSBOs
+    initializeSSBOs(scene);
 
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
@@ -280,7 +284,6 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     return shaderProgram;
 }
 
-// TODO: move to be Object Oriented
 std::vector<Triangle> combineTriangles(const Scene& scene) {
     std::vector<Triangle> allTriangles;
     for (const auto& mesh : scene.meshes) {
@@ -295,6 +298,39 @@ std::vector<Triangle> combineTriangles(const Scene& scene) {
         }
     }
     return allTriangles;
+}
+
+void initializeSSBOs(const Scene& scene) {
+    // Combine triangles from all meshes
+    std::vector<Triangle> allTriangles = combineTriangles(scene);
+
+    // Debug output
+    std::cout << "Number of triangles: " << allTriangles.size() << std::endl;
+    for (const auto& tri : allTriangles) {
+        std::cout << "Triangle: (" 
+                  << tri.v0.x << ", " << tri.v0.y << ", " << tri.v0.z << "), ("
+                  << tri.v1.x << ", " << tri.v1.y << ", " << tri.v1.z << "), ("
+                  << tri.v2.x << ", " << tri.v2.y << ", " << tri.v2.z << ")"
+                  << std::endl;
+    }
+
+    // Create and bind the triangle SSBO
+    glGenBuffers(1, &triangleSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+
+    // Create and bind the material SSBO
+    glGenBuffers(1, &materialSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.materials.size() * sizeof(Material), scene.materials.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+
+    // Create and bind the light SSBO
+    glGenBuffers(1, &lightSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
 }
 
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
@@ -313,39 +349,13 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invViewMatrix"), 1, GL_FALSE, glm::value_ptr(invViewMatrix));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invProjectionMatrix"), 1, GL_FALSE, glm::value_ptr(invProjMatrix));
     
-    // Send materials data
-    for (size_t i = 0; i < scene.materials.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(scene.materials[i].albedo));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), scene.materials[i].metallic);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].roughness").c_str()), scene.materials[i].roughness);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].reflectivity").c_str()), scene.materials[i].reflectivity);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].transparency").c_str()), scene.materials[i].transparency);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].ior").c_str()), scene.materials[i].ior);
-    }
-    
-    // Send light data
-    for (size_t i = 0; i < scene.lights.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform4fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].positionOrDirection").c_str()), 1, glm::value_ptr(scene.lights[i].positionOrDirection));
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].color").c_str()), 1, glm::value_ptr(scene.lights[i].getColor()));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("lights[" + index + "].power").c_str()), scene.lights[i].power);
-    }
-    
-    // Combine triangles from all meshes
-    std::vector<Triangle> allTriangles = combineTriangles(scene);
-    const int maxTriangles = 100; // Must match MAX_TRIANGLES in the shader.
-    int numTriangles = std::min((int)allTriangles.size(), maxTriangles);
-    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), numTriangles);
-    
-    // Send triangle data
-    for (int i = 0; i < numTriangles; ++i) {
-        std::string idx = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v0").c_str()), 1, &allTriangles[i].v0[0]);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v1").c_str()), 1, &allTriangles[i].v1[0]);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v2").c_str()), 1, &allTriangles[i].v2[0]);
-        glUniform1i(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].materialIndex").c_str()), allTriangles[i].materialIndex);
-    }
+    // Bind the SSBOs
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+
+    // Send the number of triangles
+    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), scene.meshes.size() * scene.meshes[0].triangles.size());
 }
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {

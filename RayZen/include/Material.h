@@ -15,6 +15,6 @@ struct Material {
              float reflectivity = 0.0f, float transparency = 0.0f, float ior = 1.5f)
         : albedo(albedo), metallic(metallic), roughness(roughness), 
           reflectivity(reflectivity), transparency(transparency), ior(ior) {}
-};
+} __attribute__((std430));
 
 #endif
