@@ -24,6 +24,15 @@ public:
     float yaw;
     float pitch;
 
+    // Default constructor with default camera parameters
+    Camera()
+        : position(glm::vec3(0.0f, 0.0f, 3.0f)), target(glm::vec3(0.0f, 0.0f, -1.0f)), up(glm::vec3(0.0f, 1.0f, 0.0f)),
+          fov(45.0f), aspectRatio(800.0f / 600.0f), nearClip(0.1f), farClip(100.0f), speed(1.f), sensitivity(0.1f), yaw(-90.0f), pitch(0.0f) {
+        updateViewMatrix();
+        updateProjectionMatrix();
+    }
+
+    // Custom constructor with custom camera parameters
     Camera(glm::vec3 position, glm::vec3 target, glm::vec3 up, float fov, float aspectRatio, float nearClip, float farClip)
         : position(position), target(target), up(up), fov(fov), aspectRatio(aspectRatio), nearClip(nearClip), farClip(farClip), speed(1.f), sensitivity(0.1f), yaw(-90.0f), pitch(0.0f) {
         updateViewMatrix();

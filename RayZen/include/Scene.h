@@ -2,23 +2,20 @@
 #define SCENE_H
 
 #include <vector>
-#include "Ray.h"
-#include "Mesh.h"
+#include "Camera.h"
+#include "Material.h"
 #include "Light.h"
-#include "HitRecord.h"
+#include "Mesh.h"
 
+// The Scene class groups together the camera, lights, materials, and meshes.
 class Scene {
 public:
-    std::vector<Mesh> objects;
+    Camera camera;
+    std::vector<Material> materials;
     std::vector<Light> lights;
+    std::vector<Mesh> meshes;
 
-    void addObject(const Mesh& obj) {
-        objects.push_back(obj);
-    }
-
-    void addLight(const Light& light) {
-        lights.push_back(light);
-    }
+    Scene() {};
 };
 
 #endif

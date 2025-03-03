@@ -6,6 +6,8 @@ uniform vec2 resolution;
 struct Camera {
     mat4 viewMatrix;
     mat4 projectionMatrix;
+    mat4 invViewMatrix;
+    mat4 invProjectionMatrix;
     vec3 position;
 };
 uniform Camera camera;
@@ -43,6 +45,7 @@ out vec4 FragColor;
 // Constants
 const vec3 ambientLightColor = vec3(0.05, 0.05, 0.05);
 
+// Ray structure
 struct Ray {
     vec3 origin;
     vec3 direction;
@@ -71,9 +74,9 @@ Ray calculateRay(vec2 uv, vec2 seed) {
     vec2 jitter = vec2(rand(seed), rand(seed + vec2(1.0))) * 0.002;
     uv += jitter;
     vec4 ray_clip = vec4(uv * 2.0 - 1.0, -1.0, 1.0);
-    vec4 ray_eye = inverse(camera.projectionMatrix) * ray_clip;
+    vec4 ray_eye = camera.invProjectionMatrix * ray_clip;
     ray_eye = vec4(ray_eye.xy, -1.0, 0.0);
-    vec3 ray_world = (inverse(camera.viewMatrix) * ray_eye).xyz;
+    vec3 ray_world = (camera.invViewMatrix * ray_eye).xyz;
     return Ray(camera.position, normalize(ray_world));
 }
 
@@ -141,6 +144,8 @@ vec3 reflectRay(vec3 incident, vec3 normal) {
 
 vec3 refractRay(vec3 incident, vec3 normal, float ior) {
     float cosi = clamp(dot(incident, normal), -1.0, 1.0);
+    // TODO: check if this is needed
+    //if (dot(incident, normal) > 0.0) normal = -normal;
     float etai = 1.0, etat = ior;
     vec3 n = normal;
     if (cosi < 0.0) {
@@ -186,6 +191,7 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         }
         attenuation *= shadowAttenuation;
 
+        // Calculate shading terms
         vec3 halfwayDir = normalize(lightDir + viewDir);
         float NdotL = max(dot(normal, lightDir), 0.0);
         float NdotV = max(dot(normal, viewDir), 0.0);
@@ -220,8 +226,8 @@ void main() {
     vec2 seed = uv;
 
     vec3 color = vec3(0.0);
-    int maxBounces = 5;
-    int numSamples = 30;
+    int maxBounces = 3;
+    int numSamples = 3;
 
     for (int sample = 0; sample < numSamples; ++sample) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);

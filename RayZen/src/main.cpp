@@ -6,6 +6,7 @@
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include "Ray.h"
 #include "Scene.h"
@@ -21,8 +22,7 @@ unsigned int SCR_HEIGHT = 600;
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Material>& materials, const std::vector<Light>& lights);
-void sendMeshDataToShader(GLuint shaderProgram, const Mesh& mesh);
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 
 // Global variables
@@ -69,8 +69,11 @@ int main() {
     // Setup quad for rendering
     setupQuad(quadVAO, quadVBO);
 
+    // Define scene
+    Scene scene = Scene();
+
     // Define camera
-    Camera camera(
+    scene.camera = Camera(
         glm::vec3(0.0f, 0.0f, 3.0f), // Position
         glm::vec3(0.0f, 0.0f, -1.0f), // Direction
         glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
@@ -81,7 +84,7 @@ int main() {
     );
 
     // Define materials
-    std::vector<Material> materials = {
+    scene.materials = {
         // Red matte material (non-metallic, rough)
         Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
         // Green metallic material (metallic, smooth)
@@ -94,16 +97,40 @@ int main() {
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
 
-    Mesh mesh;
-    if (!mesh.loadFromOBJ("../meshes/cube.obj", /*materialIndex=*/1)) {
-        std::cerr << "Failed to load mesh!" << std::endl;
-        return -1;
+    // Define meshes
+    // Load first cube: moved further to the left.
+    Mesh cube1;
+    if (cube1.loadFromOBJ("../meshes/cube.obj", 0)) {
+        cube1.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.0f, 0.0f, 0.0f));
+        scene.meshes.push_back(cube1);
+    }
+
+    // Load second cube: moved further to the right and scaled down.
+    Mesh cube2;
+    if (cube2.loadFromOBJ("../meshes/cube.obj", 1)) {
+        cube2.transform = glm::translate(glm::mat4(1.0f), glm::vec3(3.0f, 0.0f, 0.0f)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(0.5f));
+        scene.meshes.push_back(cube2);
+    }
+
+    // Load third cube: moved further back and scaled up.
+    Mesh cube3;
+    if (cube3.loadFromOBJ("../meshes/cube.obj", 2)) {
+        cube3.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.0f)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(1.5f));
+        scene.meshes.push_back(cube3);
+    }
+
+    Mesh cube4;
+    if (cube4.loadFromOBJ("../meshes/cube.obj", 4)) {
+        cube4.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.0f, 3.0f, 0.0f)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(1.0f));
+        scene.meshes.push_back(cube4);
     }
 
     // Define lights
-    std::vector<Light> lights;
-    lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
-    lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (1, -1, 0)
+    scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
+    scene.lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (1, -1, 0)
 
 
     // Main render loop
@@ -113,18 +140,17 @@ int main() {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
-        processInput(window, camera, deltaTime);
+        processInput(window, scene.camera, deltaTime);
 
         // Print fps
-        //std::clog << 1.0/deltaTime << std::endl;
+        std::clog << 1.0/deltaTime << std::endl;
 
         // Update camera aspect ratio and projection matrix each frame
-        camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
-        camera.updateProjectionMatrix();
+        scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
+        scene.camera.updateProjectionMatrix();
 
         // Send scene data to the shader
-        sendSceneDataToShader(shaderProgram, camera, materials, lights);
-        sendMeshDataToShader(shaderProgram, mesh);
+        sendSceneDataToShader(shaderProgram, scene);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -251,57 +277,73 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     return shaderProgram;
 }
 
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Material>& materials, const std::vector<Light>& lights) {
-    glUseProgram(shaderProgram);
+// TODO: move to be Object Oriented
+std::vector<Triangle> combineTriangles(const Scene& scene) {
+    std::vector<Triangle> allTriangles;
+    for (const auto& mesh : scene.meshes) {
+        for (const auto& tri : mesh.triangles) {
+            Triangle transformed;
+            // Transform each vertex (assumes the mesh.transform is rotation/translation/uniform scale)
+            transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
+            transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
+            transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+            transformed.materialIndex = tri.materialIndex;
+            allTriangles.push_back(transformed);
+        }
+    }
+    return allTriangles;
+}
 
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
+    glUseProgram(shaderProgram);
+    
     // Send resolution uniform
     glUniform2f(glGetUniformLocation(shaderProgram, "resolution"), float(SCR_WIDTH), float(SCR_HEIGHT));
-
-    // Send camera data
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
-    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(camera.position));
-
-    // Send materials data
-    for (size_t i = 0; i < materials.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(materials[i].albedo));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), materials[i].metallic);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].roughness").c_str()), materials[i].roughness);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].reflectivity").c_str()), materials[i].reflectivity);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].transparency").c_str()), materials[i].transparency);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].ior").c_str()), materials[i].ior);
-    }
-
-    // Send light data
-    for (size_t i = 0; i < lights.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform4fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].positionOrDirection").c_str()), 1, glm::value_ptr(lights[i].positionOrDirection));
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].color").c_str()), 1, glm::value_ptr(lights[i].getColor()));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("lights[" + index + "].power").c_str()), lights[i].power);
-    }
-}
-
-// Pass the triangles to the shader as a uniform array.
-void sendMeshDataToShader(GLuint shaderProgram, const Mesh& mesh) {
-    glUseProgram(shaderProgram);
     
-    // Here we assume you won’t have more than, say, 100 triangles.
-    // Update the shader uniform “numTriangles”.
-    int numTriangles = mesh.triangles.size();
+    // Send camera data
+    glm::mat4 invViewMatrix = glm::inverse(scene.camera.viewMatrix);
+    glm::mat4 invProjMatrix = glm::inverse(scene.camera.projectionMatrix);
+
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
+    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(scene.camera.position));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invViewMatrix"), 1, GL_FALSE, glm::value_ptr(invViewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invProjectionMatrix"), 1, GL_FALSE, glm::value_ptr(invProjMatrix));
+    
+    // Send materials data
+    for (size_t i = 0; i < scene.materials.size(); ++i) {
+        std::string index = std::to_string(i);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(scene.materials[i].albedo));
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), scene.materials[i].metallic);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].roughness").c_str()), scene.materials[i].roughness);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].reflectivity").c_str()), scene.materials[i].reflectivity);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].transparency").c_str()), scene.materials[i].transparency);
+        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].ior").c_str()), scene.materials[i].ior);
+    }
+    
+    // Send light data
+    for (size_t i = 0; i < scene.lights.size(); ++i) {
+        std::string index = std::to_string(i);
+        glUniform4fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].positionOrDirection").c_str()), 1, glm::value_ptr(scene.lights[i].positionOrDirection));
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].color").c_str()), 1, glm::value_ptr(scene.lights[i].getColor()));
+        glUniform1f(glGetUniformLocation(shaderProgram, ("lights[" + index + "].power").c_str()), scene.lights[i].power);
+    }
+    
+    // Combine triangles from all meshes
+    std::vector<Triangle> allTriangles = combineTriangles(scene);
+    const int maxTriangles = 100; // Must match MAX_TRIANGLES in the shader.
+    int numTriangles = std::min((int)allTriangles.size(), maxTriangles);
     glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), numTriangles);
     
-    // For each triangle, send the vertices and material index.
-    // For simplicity, assume the shader has an array "triangles[100]" of type Triangle.
+    // Send triangle data
     for (int i = 0; i < numTriangles; ++i) {
         std::string idx = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v0").c_str()), 1, &mesh.triangles[i].v0[0]);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v1").c_str()), 1, &mesh.triangles[i].v1[0]);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v2").c_str()), 1, &mesh.triangles[i].v2[0]);
-        glUniform1i(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].materialIndex").c_str()), mesh.triangles[i].materialIndex);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v0").c_str()), 1, &allTriangles[i].v0[0]);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v1").c_str()), 1, &allTriangles[i].v1[0]);
+        glUniform3fv(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].v2").c_str()), 1, &allTriangles[i].v2[0]);
+        glUniform1i(glGetUniformLocation(shaderProgram, ("triangles[" + idx + "].materialIndex").c_str()), allTriangles[i].materialIndex);
     }
 }
-
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
     float quadVertices[] = {
