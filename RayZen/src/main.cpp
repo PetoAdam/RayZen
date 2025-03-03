@@ -150,7 +150,7 @@ int main() {
         scene.camera.updateProjectionMatrix();
 
         // Rotate the first cube
-        scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, 0.01f, glm::vec3(0.0f, 1.0f, 0.0f));
+        scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, scene);
