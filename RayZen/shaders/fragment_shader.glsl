@@ -71,7 +71,7 @@ vec3 randomHemisphereDirection(vec3 normal, vec2 seed) {
 }
 
 Ray calculateRay(vec2 uv, vec2 seed) {
-    vec2 jitter = vec2(rand(seed), rand(seed + vec2(1.0))) * 0.002;
+    vec2 jitter = vec2(rand(seed), rand(seed + vec2(1.0))) * 0.00002;
     uv += jitter;
     vec4 ray_clip = vec4(uv * 2.0 - 1.0, -1.0, 1.0);
     vec4 ray_eye = camera.invProjectionMatrix * ray_clip;
@@ -226,8 +226,8 @@ void main() {
     vec2 seed = uv;
 
     vec3 color = vec3(0.0);
-    int maxBounces = 3;
-    int numSamples = 3;
+    int maxBounces = 4;
+    int numSamples = 5;
 
     for (int sample = 0; sample < numSamples; ++sample) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + sample + 1.0);
@@ -273,10 +273,12 @@ void main() {
                 float F0 = pow((1.0 - hitMaterial.ior) / (1.0 + hitMaterial.ior), 2.0);
                 vec3 F0vec = vec3(F0);
                 vec3 F = fresnelSchlick(cosi, F0vec);
-                float fresnelProbability = clamp(F.r, 0.0, 1.0);
+                float fresnelProbability = clamp(normalize(F.r), 0.0, 1.0);
 
-                if (false /*randVal < fresnelProbability * hitMaterial.transparency*/) {
+                //TODO: Check other option?
+                if (randVal > hitMaterial.transparency /*randVal < fresnelProbability * hitMaterial.transparency*/) {
                     currentDirection = reflectRay(currentDirection, hitNormal);
+
                 } else {
                     //currentDirection = refractRay(currentDirection, hitNormal, hitMaterial.ior);
                 }
