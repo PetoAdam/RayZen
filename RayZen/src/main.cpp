@@ -25,6 +25,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 void initializeSSBOs(const Scene& scene);
+void updateSSBOs(const Scene& scene);
 
 // Global variables
 GLuint quadVAO, quadVBO;
@@ -155,6 +156,9 @@ int main() {
 
         // Rotate the first cube
         scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // Update SSBOs with the transformed vertex data
+        updateSSBOs(scene);
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, scene);
@@ -317,7 +321,7 @@ void initializeSSBOs(const Scene& scene) {
     // Create and bind the triangle SSBO
     glGenBuffers(1, &triangleSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_STATIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
 
     // Create and bind the material SSBO
@@ -331,6 +335,15 @@ void initializeSSBOs(const Scene& scene) {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+}
+
+void updateSSBOs(const Scene& scene) {
+    // Combine triangles from all meshes
+    std::vector<Triangle> allTriangles = combineTriangles(scene);
+
+    // Update the triangle SSBO with the transformed vertex data
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allTriangles.size() * sizeof(Triangle), allTriangles.data());
 }
 
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
