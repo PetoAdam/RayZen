@@ -34,8 +34,17 @@ GLuint shaderProgram;
 GLuint triangleSSBO, materialSSBO, lightSSBO;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
+bool debugShowLights = false;
 
 int main() {
+    // Print control scheme at startup
+    std::cout << "==== RayZen Controls ====" << std::endl;
+    std::cout << "WASD: Move camera" << std::endl;
+    std::cout << "Mouse Drag (LMB): Rotate camera" << std::endl;
+    std::cout << "L: Toggle light debug markers" << std::endl;
+    std::cout << "ESC: Quit" << std::endl;
+    std::cout << "========================" << std::endl;
+
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -104,7 +113,7 @@ int main() {
     // Define meshes
     // Load monkey
     Mesh monkey;
-    if (monkey.loadFromOBJ("../meshes/monkey.obj", 0)) {
+    if (monkey.loadFromOBJ("../meshes/monkey.obj", 1)) {
         scene.meshes.push_back(monkey);
     }
 
@@ -134,8 +143,21 @@ int main() {
         lastFrame = currentFrame;
         processInput(window, scene.camera, deltaTime);
 
-        // Print fps
-        std::clog << 1.0/deltaTime << std::endl;
+        // Toggle debugShowLights with 'L' key
+        static bool lKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS) {
+            if (!lKeyPressed) {
+                debugShowLights = !debugShowLights;
+                lKeyPressed = true;
+                // Print debug message on its own line
+                std::cout << std::endl << "Light debugging: " << (debugShowLights ? "On" : "Off") << std::endl;
+            }
+        } else {
+            lKeyPressed = false;
+        }
+
+        // Print fps on a single line at the bottom of the terminal
+        std::cout << "\033[2K\r" << "FPS: " << 1.0/deltaTime << std::flush;
 
         // Update camera aspect ratio and projection matrix each frame
         scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
@@ -149,6 +171,10 @@ int main() {
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, scene);
+
+        // Set debugShowLights uniform
+        GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
+        glUniform1i(debugLoc, debugShowLights ? 1 : 0);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

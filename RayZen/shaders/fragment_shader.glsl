@@ -65,6 +65,7 @@ layout(std430, binding = 4) buffer BVHTriIdxBuffer {
 };
 
 uniform int numTriangles;
+uniform bool debugShowLights;
 
 out vec4 FragColor;
 
@@ -370,5 +371,28 @@ void main() {
     }
     color /= float(numSamples);
     color = clamp(color, 0.0, 1.0);
+
+    // Debug: Render light positions as screen-space markers
+    if (debugShowLights) {
+        for (int i = 0; i < 10; ++i) {
+            Light light = lights[i];
+            if (light.positionOrDirection.w == 1.0) { // Only for point lights
+                // Project world position to NDC
+                vec4 clip = camera.projectionMatrix * camera.viewMatrix * vec4(light.positionOrDirection.xyz, 1.0);
+                if (clip.w > 0.0) {
+                    vec3 ndc = clip.xyz / clip.w;
+                    // Convert NDC to screen coordinates
+                    vec2 screen = (ndc.xy * 0.5 + 0.5) * resolution;
+                    float dist = length(gl_FragCoord.xy - screen);
+                    float markerRadius = 8.0; // pixels
+                    if (dist < markerRadius) {
+                        // Draw a colored circle (yellow)
+                        float alpha = smoothstep(markerRadius, markerRadius-2.0, dist);
+                        color = mix(color, light.color, alpha);
+                    }
+                }
+            }
+        }
+    }
     FragColor = vec4(color, 1.0);
 }
