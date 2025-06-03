@@ -37,6 +37,13 @@ struct Triangle {
     int materialIndex;
 };
 
+struct BVHNode {
+    vec3 boundsMin;
+    int leftFirst;
+    vec3 boundsMax;
+    int count;
+};
+
 layout(std430, binding = 0) buffer TriangleBuffer {
     Triangle triangles[];
 };
@@ -47,6 +54,14 @@ layout(std430, binding = 1) buffer MaterialBuffer {
 
 layout(std430, binding = 2) buffer LightBuffer {
     Light lights[];
+};
+
+layout(std430, binding = 3) buffer BVHNodeBuffer {
+    BVHNode bvhNodes[];
+};
+
+layout(std430, binding = 4) buffer BVHTriIdxBuffer {
+    int bvhTriIndices[];
 };
 
 uniform int numTriangles;
@@ -122,21 +137,68 @@ bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out v
     return false;
 }
 
+// Ray-AABB intersection
+bool intersectAABB(vec3 rayOrig, vec3 rayDirInv, vec3 bmin, vec3 bmax, out float tmin, out float tmax) {
+    vec3 t0 = (bmin - rayOrig) * rayDirInv;
+    vec3 t1 = (bmax - rayOrig) * rayDirInv;
+    vec3 tsmaller = min(t0, t1);
+    vec3 tbigger = max(t0, t1);
+    tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+    tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
+    return tmax >= max(tmin, 0.0);
+}
+
+// BVH traversal for closest hit
+bool traverseBVH(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {
+    tHit = 1e30;
+    bool hit = false;
+    int stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // root node
+    vec3 invDir = 1.0 / ray.direction;
+    while (stackPtr > 0) {
+        int nidx = stack[--stackPtr];
+        BVHNode node = bvhNodes[nidx];
+        float tmin, tmax;
+        if (!intersectAABB(ray.origin, invDir, node.boundsMin, node.boundsMax, tmin, tmax) || tmin > tHit)
+            continue;
+        if (node.count > 0) { // leaf
+            for (int i = 0; i < node.count; ++i) {
+                int triIdx = bvhTriIndices[node.leftFirst + i];
+                float t;
+                vec3 tempHit, tempNormal;
+                int tempMat;
+                if (hitTriangle(triangles[triIdx], ray, t, tempHit, tempNormal, tempMat)) {
+                    if (t < tHit) {
+                        tHit = t;
+                        hitPoint = tempHit;
+                        normal = tempNormal;
+                        materialIndex = tempMat;
+                        hit = true;
+                    }
+                }
+            }
+        } else { // internal
+            stack[stackPtr++] = node.leftFirst;
+            stack[stackPtr++] = node.leftFirst + 1;
+        }
+    }
+    return hit;
+}
+
 // Shadow test: cast a ray from hitPoint along lightDir and check for occlusion
 bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance, out float shadowAttenuation) {
     shadowAttenuation = 1.0;
-    // Iterate over all triangles in the mesh.
-    for (int i = 0; i < numTriangles; i++) {
-        float t;
-        vec3 tempHit, tempNormal;
-        int tempMat;
-        if (hitTriangle(triangles[i], Ray(hitPoint, lightDir), t, tempHit, tempNormal, tempMat)) {
-            if (t > 0.001 && t < maxDistance) {
-                float transparency = materials[tempMat].transparency;
-                shadowAttenuation *= transparency;
-                if (shadowAttenuation < 0.05)
-                    return true;
-            }
+    float tHit;
+    vec3 tempHit, tempNormal;
+    int tempMat;
+    Ray shadowRay = Ray(hitPoint, lightDir);
+    if (traverseBVH(shadowRay, tHit, tempHit, tempNormal, tempMat)) {
+        if (tHit > 0.001 && tHit < maxDistance) {
+            float transparency = materials[tempMat].transparency;
+            shadowAttenuation *= transparency;
+            if (shadowAttenuation < 0.05)
+                return true;
         }
     }
     return false;
@@ -254,25 +316,10 @@ void main() {
             float closestT = 1e30;
             Material hitMaterial;
 
-            // Loop over all triangles
-            for (int i = 0; i < numTriangles; ++i) {
-                float t;
-                vec3 tempHit, tempNormal;
-                int tempMat;
-                if (hitTriangle(triangles[i], Ray(currentOrigin, currentDirection), t, tempHit, tempNormal, tempMat)) {
-                    if (t < closestT) {
-                        closestT = t;
-                        hitPoint = tempHit;
-                        hitNormal = tempNormal;
-                        materialIndex = tempMat;
-                        hitMaterial = materials[tempMat];
-                    }
-                }
-            }
-
-            if (materialIndex == -1)
-                break;
-
+            // Use BVH traversal for intersection
+            bool found = traverseBVH(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex);
+            if (!found) break;
+            hitMaterial = materials[materialIndex];
             vec3 viewDir = normalize(camera.position - hitPoint);
             color += throughput * calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
 

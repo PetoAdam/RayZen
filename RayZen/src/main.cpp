@@ -13,6 +13,7 @@
 #include "Camera.h"
 #include "Material.h"
 #include "Mesh.h"
+#include "BVH.h"
 
 // Constants
 unsigned int SCR_WIDTH = 800;
@@ -131,7 +132,7 @@ int main() {
         scene.camera.updateProjectionMatrix();
 
         // Rotate the first cube
-        scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
+        //scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
 
         // Update SSBOs with the transformed vertex data
         updateSSBOs(scene);
@@ -284,15 +285,22 @@ void initializeSSBOs(const Scene& scene) {
     // Combine triangles from all meshes
     std::vector<Triangle> allTriangles = combineTriangles(scene);
 
+    // Log BVH generation
+    std::cout << "[RayZen] Generating BVH for scene with " << allTriangles.size() << " triangles..." << std::endl;
+
+    // Build BVH
+    BVH bvh;
+    bvh.build(allTriangles);
+
     // Debug output
-    std::cout << "Number of triangles: " << allTriangles.size() << std::endl;
-    for (const auto& tri : allTriangles) {
-        std::cout << "Triangle: (" 
-                  << tri.v0.x << ", " << tri.v0.y << ", " << tri.v0.z << "), ("
-                  << tri.v1.x << ", " << tri.v1.y << ", " << tri.v1.z << "), ("
-                  << tri.v2.x << ", " << tri.v2.y << ", " << tri.v2.z << ")"
-                  << std::endl;
-    }
+    //std::cout << "Number of triangles: " << allTriangles.size() << std::endl;
+    //for (const auto& tri : allTriangles) {
+    //    std::cout << "Triangle: (" 
+    //              << tri.v0.x << ", " << tri.v0.y << ", " << tri.v0.z << "), ("
+    //              << tri.v1.x << ", " << tri.v1.y << ", " << tri.v1.z << "), ("
+    //              << tri.v2.x << ", " << tri.v2.y << ", " << tri.v2.z << ")"
+    //              << std::endl;
+    //}
 
     // Create and bind the triangle SSBO
     glGenBuffers(1, &triangleSSBO);
@@ -311,6 +319,20 @@ void initializeSSBOs(const Scene& scene) {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+
+    // Create and bind the BVH SSBO
+    GLuint bvhSSBO;
+    glGenBuffers(1, &bvhSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.nodes.size() * sizeof(BVHNode), bvh.nodes.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvhSSBO);
+
+    // Create and bind the BVH triangle index SSBO
+    GLuint bvhTriIdxSSBO;
+    glGenBuffers(1, &bvhTriIdxSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhTriIdxSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.triIndices.size() * sizeof(int), bvh.triIndices.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, bvhTriIdxSSBO);
 }
 
 void updateSSBOs(const Scene& scene) {
@@ -320,6 +342,7 @@ void updateSSBOs(const Scene& scene) {
     // Update the triangle SSBO with the transformed vertex data
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allTriangles.size() * sizeof(Triangle), allTriangles.data());
+    // TODO: If meshes move, rebuild and update the BVH and its SSBOs here for dynamic scenes.
 }
 
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
