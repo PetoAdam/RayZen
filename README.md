@@ -4,6 +4,10 @@
 
 RayZen is a modern, open-source GPU-accelerated path tracer written in C++ and OpenGL. It is designed for real-time physically-based rendering (PBR) of 3D scenes, supporting advanced features such as BVH acceleration, physically-based materials, and interactive camera controls. RayZen is ideal for graphics research, education, and as a foundation for your own renderer.
 
+![Preview](./docs/resources/preview.png)
+
+
+
 ---
 
 ## Features

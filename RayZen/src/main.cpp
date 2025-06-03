@@ -108,6 +108,16 @@ int main() {
         scene.meshes.push_back(monkey);
     }
 
+    // Add a large cube under the monkey as a mirror floor
+    Mesh floorCube;
+    if (floorCube.loadFromOBJ("../meshes/cube.obj", 2)) { // 2 = mirror-like material
+        // Scale the cube to be large and flatten it to act as a floor
+        floorCube.transform = glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f));
+        // Move it down so it's under the monkey
+        floorCube.transform = glm::translate(floorCube.transform, glm::vec3(0.0f, -3.0f, 0.0f));
+        scene.meshes.push_back(floorCube);
+    }
+
     // Define lights
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)

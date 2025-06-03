@@ -308,6 +308,7 @@ void main() {
         vec3 currentOrigin = ray.origin;
         vec3 currentDirection = ray.direction;
         vec3 throughput = vec3(1.0);
+        bool hitSomething = false;
 
         for (int bounce = 0; bounce < maxBounces; ++bounce) {
             vec2 tempseed = seed * float(bounce * bounce) * 12793.46 + float(bounce) * 1423.34;
@@ -318,7 +319,14 @@ void main() {
 
             // Use BVH traversal for intersection
             bool found = traverseBVH(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex);
-            if (!found) break;
+            if (!found) {
+                // Skybox: blueish gradient, less bright
+                float t = 0.5 * (normalize(currentDirection).y + 1.0);
+                vec3 skyColor = mix(vec3(0.15, 0.25, 0.45), vec3(0.5, 0.7, 1.0), t); // deep blue to light blue
+                color += throughput * skyColor;
+                break;
+            }
+            hitSomething = true;
             hitMaterial = materials[materialIndex];
             vec3 viewDir = normalize(camera.position - hitPoint);
             color += throughput * calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
