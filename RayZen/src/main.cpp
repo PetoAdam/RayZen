@@ -101,34 +101,10 @@ int main() {
     };
 
     // Define meshes
-    // Load first cube: moved further to the left.
-    Mesh cube1;
-    if (cube1.loadFromOBJ("../meshes/cube.obj", 0)) {
-        cube1.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.0f, 0.0f, 0.0f));
-        scene.meshes.push_back(cube1);
-    }
-
-    // Load second cube: moved further to the right and scaled down.
-    Mesh cube2;
-    if (cube2.loadFromOBJ("../meshes/cube.obj", 1)) {
-        cube2.transform = glm::translate(glm::mat4(1.0f), glm::vec3(3.0f, 0.0f, 0.0f)) *
-                        glm::scale(glm::mat4(1.0f), glm::vec3(0.5f));
-        scene.meshes.push_back(cube2);
-    }
-
-    // Load third cube: moved further back and scaled up.
-    Mesh cube3;
-    if (cube3.loadFromOBJ("../meshes/cube.obj", 2)) {
-        cube3.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.0f)) *
-                        glm::scale(glm::mat4(1.0f), glm::vec3(1.5f));
-        scene.meshes.push_back(cube3);
-    }
-
-    Mesh cube4;
-    if (cube4.loadFromOBJ("../meshes/cube.obj", 3)) {
-        cube4.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.0f, 3.0f, 0.0f)) *
-                        glm::scale(glm::mat4(1.0f), glm::vec3(1.0f));
-        scene.meshes.push_back(cube4);
+    // Load monkey
+    Mesh monkey;
+    if (monkey.loadFromOBJ("../meshes/monkey.obj", 0)) {
+        scene.meshes.push_back(monkey);
     }
 
     // Define lights
