@@ -6,12 +6,14 @@
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include "Ray.h"
-#include "Sphere.h"
 #include "Scene.h"
 #include "Camera.h"
 #include "Material.h"
+#include "Mesh.h"
+#include "BVH.h"
 
 // Constants
 unsigned int SCR_WIDTH = 800;
@@ -21,16 +23,28 @@ unsigned int SCR_HEIGHT = 600;
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights);
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
+void initializeSSBOs(const Scene& scene);
+void updateSSBOs(const Scene& scene);
 
 // Global variables
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
+GLuint triangleSSBO, materialSSBO, lightSSBO;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
+bool debugShowLights = false;
 
 int main() {
+    // Print control scheme at startup
+    std::cout << "==== RayZen Controls ====" << std::endl;
+    std::cout << "WASD: Move camera" << std::endl;
+    std::cout << "Mouse Drag (LMB): Rotate camera" << std::endl;
+    std::cout << "L: Toggle light debug markers" << std::endl;
+    std::cout << "ESC: Quit" << std::endl;
+    std::cout << "========================" << std::endl;
+
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -41,7 +55,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Path Tracer", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "RayZen", nullptr, nullptr);
     if (window == nullptr) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -68,8 +82,11 @@ int main() {
     // Setup quad for rendering
     setupQuad(quadVAO, quadVBO);
 
+    // Define scene
+    Scene scene = Scene();
+
     // Define camera
-    Camera camera(
+    scene.camera = Camera(
         glm::vec3(0.0f, 0.0f, 3.0f), // Position
         glm::vec3(0.0f, 0.0f, -1.0f), // Direction
         glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
@@ -80,7 +97,7 @@ int main() {
     );
 
     // Define materials
-    std::vector<Material> materials = {
+    scene.materials = {
         // Red matte material (non-metallic, rough)
         Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
         // Green metallic material (metallic, smooth)
@@ -88,27 +105,34 @@ int main() {
         // Mirror-like material (fully reflective, smooth)
         Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.1f, 1.0f, 0.0f, 1.5f),
         // Glass-like material (transparent, smooth)
-        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.9f, 1.5f),
+        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.99f, 1.5f),
         // Rough surface material (non-metallic, rough)
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
 
-    // Define spheres
-    std::vector<Sphere> spheres = {
-        // First sphere (position, radius, material index)
-        Sphere(glm::vec3(0.0f, 1.0f, -1.0f), 0.5f, 0), // Red matte
-        Sphere(glm::vec3(1.0f, 0.0f, -1.5f), 0.5f, 1), // Green shiny
-        Sphere(glm::vec3(-1.5f, -0.5f, -2.0f), 0.7f, 2), // Mirror-like
-        Sphere(glm::vec3(2.0f, -1.0f, -3.0f), 0.6f, 3), // Transparent (glass)
-        Sphere(glm::vec3(0.5f, -1.5f, -2.5f), 0.5f, 4),  // Rough surface
-        Sphere(glm::vec3(0.0f, 0.0f, -15.0f), 10.0f, 0),  // Rough surface
-    };
+    // Define meshes
+    // Load monkey
+    Mesh monkey;
+    if (monkey.loadFromOBJ("../meshes/monkey.obj", 1)) {
+        scene.meshes.push_back(monkey);
+    }
+
+    // Add a large cube under the monkey as a mirror floor
+    Mesh floorCube;
+    if (floorCube.loadFromOBJ("../meshes/cube.obj", 2)) { // 2 = mirror-like material
+        // Scale the cube to be large and flatten it to act as a floor
+        floorCube.transform = glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f));
+        // Move it down so it's under the monkey
+        floorCube.transform = glm::translate(floorCube.transform, glm::vec3(0.0f, -3.0f, 0.0f));
+        scene.meshes.push_back(floorCube);
+    }
 
     // Define lights
-    std::vector<Light> lights;
-    lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
-    lights.push_back(Light(glm::vec4(1.0f, -1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (1, -1, 0)
+    scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
+    scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
 
+    // Initialize SSBOs
+    initializeSSBOs(scene);
 
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
@@ -117,17 +141,40 @@ int main() {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
-        processInput(window, camera, deltaTime);
+        processInput(window, scene.camera, deltaTime);
 
-        // Print fps
-        //std::clog << 1.0/deltaTime << std::endl;
+        // Toggle debugShowLights with 'L' key
+        static bool lKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS) {
+            if (!lKeyPressed) {
+                debugShowLights = !debugShowLights;
+                lKeyPressed = true;
+                // Print debug message on its own line
+                std::cout << std::endl << "Light debugging: " << (debugShowLights ? "On" : "Off") << std::endl;
+            }
+        } else {
+            lKeyPressed = false;
+        }
+
+        // Print fps on a single line at the bottom of the terminal
+        std::cout << "\033[2K\r" << "FPS: " << 1.0/deltaTime << std::flush;
 
         // Update camera aspect ratio and projection matrix each frame
-        camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
-        camera.updateProjectionMatrix();
+        scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
+        scene.camera.updateProjectionMatrix();
+
+        // Rotate the first cube
+        //scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // Update SSBOs with the transformed vertex data
+        updateSSBOs(scene);
 
         // Send scene data to the shader
-        sendSceneDataToShader(shaderProgram, camera, spheres, materials, lights);
+        sendSceneDataToShader(shaderProgram, scene);
+
+        // Set debugShowLights uniform
+        GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
+        glUniform1i(debugLoc, debugShowLights ? 1 : 0);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -254,43 +301,109 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     return shaderProgram;
 }
 
-void sendSceneDataToShader(GLuint shaderProgram, const Camera& camera, const std::vector<Sphere>& spheres, const std::vector<Material>& materials, const std::vector<Light>& lights) {
-    glUseProgram(shaderProgram);
+std::vector<Triangle> combineTriangles(const Scene& scene) {
+    std::vector<Triangle> allTriangles;
+    for (const auto& mesh : scene.meshes) {
+        for (const auto& tri : mesh.triangles) {
+            Triangle transformed;
+            // Transform each vertex (assumes the mesh.transform is rotation/translation/uniform scale)
+            transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
+            transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
+            transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+            transformed.materialIndex = tri.materialIndex;
+            allTriangles.push_back(transformed);
+        }
+    }
+    return allTriangles;
+}
 
+void initializeSSBOs(const Scene& scene) {
+    // Combine triangles from all meshes
+    std::vector<Triangle> allTriangles = combineTriangles(scene);
+
+    // Log BVH generation
+    std::cout << "[RayZen] Generating BVH for scene with " << allTriangles.size() << " triangles..." << std::endl;
+
+    // Build BVH
+    BVH bvh;
+    bvh.build(allTriangles);
+
+    // Debug output
+    //std::cout << "Number of triangles: " << allTriangles.size() << std::endl;
+    //for (const auto& tri : allTriangles) {
+    //    std::cout << "Triangle: (" 
+    //              << tri.v0.x << ", " << tri.v0.y << ", " << tri.v0.z << "), ("
+    //              << tri.v1.x << ", " << tri.v1.y << ", " << tri.v1.z << "), ("
+    //              << tri.v2.x << ", " << tri.v2.y << ", " << tri.v2.z << ")"
+    //              << std::endl;
+    //}
+
+    // Create and bind the triangle SSBO
+    glGenBuffers(1, &triangleSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+
+    // Create and bind the material SSBO
+    glGenBuffers(1, &materialSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.materials.size() * sizeof(Material), scene.materials.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+
+    // Create and bind the light SSBO
+    glGenBuffers(1, &lightSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+
+    // Create and bind the BVH SSBO
+    GLuint bvhSSBO;
+    glGenBuffers(1, &bvhSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.nodes.size() * sizeof(BVHNode), bvh.nodes.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvhSSBO);
+
+    // Create and bind the BVH triangle index SSBO
+    GLuint bvhTriIdxSSBO;
+    glGenBuffers(1, &bvhTriIdxSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhTriIdxSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.triIndices.size() * sizeof(int), bvh.triIndices.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, bvhTriIdxSSBO);
+}
+
+void updateSSBOs(const Scene& scene) {
+    // Combine triangles from all meshes
+    std::vector<Triangle> allTriangles = combineTriangles(scene);
+
+    // Update the triangle SSBO with the transformed vertex data
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allTriangles.size() * sizeof(Triangle), allTriangles.data());
+    // TODO: If meshes move, rebuild and update the BVH and its SSBOs here for dynamic scenes.
+}
+
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
+    glUseProgram(shaderProgram);
+    
     // Send resolution uniform
     glUniform2f(glGetUniformLocation(shaderProgram, "resolution"), float(SCR_WIDTH), float(SCR_HEIGHT));
-
+    
     // Send camera data
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(camera.viewMatrix));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(camera.projectionMatrix));
-    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(camera.position));
+    glm::mat4 invViewMatrix = glm::inverse(scene.camera.viewMatrix);
+    glm::mat4 invProjMatrix = glm::inverse(scene.camera.projectionMatrix);
 
-    // Send spheres data
-    for (size_t i = 0; i < spheres.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].center").c_str()), 1, glm::value_ptr(spheres[i].center));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].radius").c_str()), spheres[i].radius);
-        glUniform1i(glGetUniformLocation(shaderProgram, ("spheres[" + index + "].materialIndex").c_str()), spheres[i].materialIndex);
-    }
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
+    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(scene.camera.position));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invViewMatrix"), 1, GL_FALSE, glm::value_ptr(invViewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invProjectionMatrix"), 1, GL_FALSE, glm::value_ptr(invProjMatrix));
+    
+    // Bind the SSBOs
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
 
-    // Send materials data
-    for (size_t i = 0; i < materials.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("materials[" + index + "].albedo").c_str()), 1, glm::value_ptr(materials[i].albedo));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].metallic").c_str()), materials[i].metallic);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].roughness").c_str()), materials[i].roughness);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].reflectivity").c_str()), materials[i].reflectivity);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].transparency").c_str()), materials[i].transparency);
-        glUniform1f(glGetUniformLocation(shaderProgram, ("materials[" + index + "].ior").c_str()), materials[i].ior);
-    }
-
-    // Send light data
-    for (size_t i = 0; i < lights.size(); ++i) {
-        std::string index = std::to_string(i);
-        glUniform4fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].positionOrDirection").c_str()), 1, glm::value_ptr(lights[i].positionOrDirection));
-        glUniform3fv(glGetUniformLocation(shaderProgram, ("lights[" + index + "].color").c_str()), 1, glm::value_ptr(lights[i].getColor()));
-        glUniform1f(glGetUniformLocation(shaderProgram, ("lights[" + index + "].power").c_str()), lights[i].power);
-    }
+    // Send the number of triangles
+    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), scene.meshes.size() * scene.meshes[0].triangles.size());
 }
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
