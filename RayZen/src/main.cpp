@@ -156,9 +156,6 @@ int main() {
             lKeyPressed = false;
         }
 
-        // Print fps on a single line at the bottom of the terminal
-        std::cout << "\033[2K\r" << "FPS: " << 1.0/deltaTime << std::flush;
-
         // Update camera aspect ratio and projection matrix each frame
         scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
         scene.camera.updateProjectionMatrix();
@@ -184,6 +181,9 @@ int main() {
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        // Print fps on a single line at the bottom of the terminal
+        std::cout << "\033[2K\r" << "FPS: " << 1.0/deltaTime << std::flush;
     }
 
     // Cleanup
