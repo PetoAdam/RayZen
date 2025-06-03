@@ -8,6 +8,8 @@
 *.obj
 # Keep cube.obj
 !RayZen/meshes/cube.obj
+# Keep monkey.obj
+!RayZen/meshes/monkey.obj
 
 # Precompiled Headers
 *.gch
