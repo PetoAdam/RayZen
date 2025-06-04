@@ -335,6 +335,14 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         auto useProgStart = std::chrono::high_resolution_clock::now();
         glUseProgram(shaderProgram);
+        // Set FPS uniform for overlay
+        static float smoothedFps = 0.0f;
+        float fps = (deltaTime > 0.0f) ? (1.0f / deltaTime) : 0.0f;
+        float alpha = 0.1f; // Smoothing factor (0.0 = no smoothing, 1.0 = instant)
+        if (smoothedFps == 0.0f) smoothedFps = fps;
+        else smoothedFps = alpha * fps + (1.0f - alpha) * smoothedFps;
+        GLint fpsLoc = glGetUniformLocation(shaderProgram, "uniformFps");
+        glUniform1f(fpsLoc, smoothedFps);
         auto useProgEnd = std::chrono::high_resolution_clock::now();
         if (firstFrame) {
             firstUseProgramMs = std::chrono::duration<double, std::milli>(useProgEnd - useProgStart).count();

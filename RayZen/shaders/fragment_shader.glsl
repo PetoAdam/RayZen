@@ -112,6 +112,73 @@ struct Ray {
     vec3 direction;
 };
 
+// FPS overlay font: 8x8 bitmap for digits 0-9 and '.' (11 chars)
+// Each row is a byte, LSB is leftmost pixel
+const int fontWidth = 8;
+const int fontHeight = 8;
+const int fontChars = 11; // 0-9 and '.'
+const int fontData[11][8] = int[11][8](
+    // '0'
+    int[8](0x3C,0x66,0x6E,0x7E,0x76,0x66,0x3C,0x00),
+    // '1'
+    int[8](0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0x00),
+    // '2'
+    int[8](0x3C,0x66,0x06,0x1C,0x30,0x66,0x7E,0x00),
+    // '3'
+    int[8](0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00),
+    // '4'
+    int[8](0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00),
+    // '5'
+    int[8](0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00),
+    // '6'
+    int[8](0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00),
+    // '7'
+    int[8](0x7E,0x66,0x0C,0x18,0x18,0x18,0x18,0x00),
+    // '8'
+    int[8](0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00),
+    // '9'
+    int[8](0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00),
+    // '.'
+    int[8](0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00)
+);
+
+// FPS uniform
+uniform float uniformFps;
+
+// Draw a single font character at pixel position (top-left), returns 1.0 if inside glyph, else 0.0
+float drawFontChar(int charIdx, vec2 fragCoord, vec2 pos, float scale) {
+    // Flip y for top-left origin
+    vec2 rel = (fragCoord - pos) / scale;
+    int x = int(rel.x);
+    int y = fontHeight - 1 - int(rel.y); // flip y
+    if (x < 0 || x >= fontWidth || y < 0 || y >= fontHeight) return 0.0;
+    int row = fontData[charIdx][y];
+    int mask = 1 << (fontWidth - 1 - x); // flip x for correct left-to-right
+    return float((row & mask) != 0);
+}
+
+// Draw a string of up to 8 chars (digits and '.') at pos, returns color overlay
+vec3 drawFpsString(vec2 fragCoord, vec2 pos, float scale, float fps, vec3 fg, vec3 bg) {
+    // Always draw as 3 digits, decimal, 1 digit: e.g. 042.7
+    int fpsInt = int(fps);
+    int tenths = int(fract(fps) * 10.0);
+    int hundreds = (fpsInt / 100) % 10;
+    int tens = (fpsInt / 10) % 10;
+    int ones = fpsInt % 10;
+    int chars[5];
+    chars[0] = hundreds;
+    chars[1] = tens;
+    chars[2] = ones;
+    chars[3] = 10; // '.'
+    chars[4] = tenths;
+    vec3 col = bg;
+    for (int i = 0; i < 5; ++i) {
+        float glyph = drawFontChar(chars[i], fragCoord, pos + vec2(i * (fontWidth+1) * scale, 0.0), scale);
+        col = mix(col, fg, glyph);
+    }
+    return col;
+}
+
 //------------------------------------------------------------------------------
 // Utility functions
 //------------------------------------------------------------------------------
@@ -528,7 +595,7 @@ void main() {
 
     vec3 color = vec3(0.0);
     int maxBounces = 3;
-    int numSamples = 2;
+    int numSamples = 1;
 
     // BVH debug overlay variables
     float bvhWire = 0.0;
@@ -637,5 +704,22 @@ void main() {
             }
         }
     }
+
+    // FPS overlay (top-left, white text, black bg)
+    float margin = 8.0;
+    vec2 fpsPos = vec2(margin, resolution.y - margin - fontHeight * 2.0); // top-left
+    float fpsScale = 2.0; // 2x font size
+    vec3 fpsCol = drawFpsString(gl_FragCoord.xy, fpsPos, fpsScale, uniformFps, vec3(1.0), color);
+    float anyFps = 0.0;
+    for (int y = 0; y < fontHeight; ++y) {
+        for (int x = 0; x < fontWidth * 6; ++x) {
+            vec2 p = fpsPos + vec2(x, y) * fpsScale;
+            if (abs(gl_FragCoord.x - p.x) < 1.0 && abs(gl_FragCoord.y - p.y) < 1.0) {
+                anyFps = 1.0;
+            }
+        }
+    }
+    color = mix(color, fpsCol, anyFps);
+
     FragColor = vec4(color, 1.0);
 }
