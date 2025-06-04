@@ -7,6 +7,8 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <filesystem>
+#include <chrono>
 
 #include "Ray.h"
 #include "Scene.h"
@@ -15,6 +17,8 @@
 #include "Mesh.h"
 #include "BVH.h"
 #include "Logger.h"
+
+namespace fs = std::filesystem;
 
 // Constants
 unsigned int SCR_WIDTH = 800;
@@ -26,7 +30,7 @@ void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
-void initializeSSBOs(const Scene& scene);
+void initializeSSBOs(const Scene& scene, bool forceRebuildBVH = false);
 void updateSSBOs(const Scene& scene);
 
 // Global variables
@@ -42,14 +46,57 @@ int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
 int debugSelectedBLAS = 0;
 int debugSelectedTri = 0;
 
+// Serialize a vector of POD types to a binary file
+template <typename T>
+bool saveVectorToFile(const std::string& filename, const std::vector<T>& vec) {
+    std::ofstream ofs(filename, std::ios::binary);
+    if (!ofs) return false;
+    size_t size = vec.size();
+    ofs.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    ofs.write(reinterpret_cast<const char*>(vec.data()), sizeof(T) * size);
+    return ofs.good();
+}
+
+template <typename T>
+bool loadVectorFromFile(const std::string& filename, std::vector<T>& vec) {
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs) return false;
+    size_t size = 0;
+    ifs.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!ifs) return false;
+    vec.resize(size);
+    ifs.read(reinterpret_cast<char*>(vec.data()), sizeof(T) * size);
+    return ifs.good();
+}
+
+// Save/load a BVH (nodes + triIndices)
+bool saveBVHToFile(const std::string& base, const BVH& bvh) {
+    return saveVectorToFile(base + ".nodes.bin", bvh.nodes) &&
+           saveVectorToFile(base + ".tris.bin", bvh.triIndices);
+}
+bool loadBVHFromFile(const std::string& base, BVH& bvh) {
+    return loadVectorFromFile(base + ".nodes.bin", bvh.nodes) &&
+           loadVectorFromFile(base + ".tris.bin", bvh.triIndices);
+}
+
+// Save/load BVHInstance vector
+bool saveBVHInstancesToFile(const std::string& filename, const std::vector<BVHInstance>& insts) {
+    return saveVectorToFile(filename, insts);
+}
+bool loadBVHInstancesFromFile(const std::string& filename, std::vector<BVHInstance>& insts) {
+    return loadVectorFromFile(filename, insts);
+}
+
 int main(int argc, char** argv) {
-    // Parse CLI log level
+    // Parse CLI log level and BVH rebuild flag
     LogLevel logLevel = LogLevel::INFO;
-    if (argc > 1) {
-        std::string lvl = argv[1];
-        if (lvl == "--log=debug") logLevel = LogLevel::DEBUG;
-        else if (lvl == "--log=info") logLevel = LogLevel::INFO;
-        else if (lvl == "--log=error") logLevel = LogLevel::ERROR;
+    bool forceRebuildBVH = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
+        else if (arg == "--log=info") logLevel = LogLevel::INFO;
+        else if (arg == "--log=error") logLevel = LogLevel::ERROR;
+        else if (arg == "--rebuild-bvh") forceRebuildBVH = true;
     }
     Logger::setLevel(logLevel);
 
@@ -95,7 +142,10 @@ int main(int argc, char** argv) {
     //glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);  // Hide the cursor when it's in the window
 
     // Load shaders
+    auto shaderStart = std::chrono::high_resolution_clock::now();
     shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+    auto shaderEnd = std::chrono::high_resolution_clock::now();
+    Logger::info(std::string("Shader compile/link time: ") + std::to_string(std::chrono::duration<double, std::milli>(shaderEnd - shaderStart).count()) + " ms");
 
     // Setup quad for rendering
     setupQuad(quadVAO, quadVBO);
@@ -151,9 +201,11 @@ int main(int argc, char** argv) {
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
 
     // Initialize SSBOs
-    initializeSSBOs(scene);
+    initializeSSBOs(scene, forceRebuildBVH);
 
     // Main render loop
+    bool firstFrame = true;
+    double firstUseProgramMs = 0.0, firstDrawMs = 0.0;
     while (!glfwWindowShouldClose(window)) {
 
         // Calculate delta time
@@ -281,9 +333,22 @@ int main(int argc, char** argv) {
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        auto useProgStart = std::chrono::high_resolution_clock::now();
         glUseProgram(shaderProgram);
+        auto useProgEnd = std::chrono::high_resolution_clock::now();
+        if (firstFrame) {
+            firstUseProgramMs = std::chrono::duration<double, std::milli>(useProgEnd - useProgStart).count();
+        }
         glBindVertexArray(quadVAO);
+        auto drawStart = std::chrono::high_resolution_clock::now();
         glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        auto drawEnd = std::chrono::high_resolution_clock::now();
+        if (firstFrame) {
+            firstDrawMs = std::chrono::duration<double, std::milli>(drawEnd - drawStart).count();
+            Logger::info(std::string("First glUseProgram time: ") + std::to_string(firstUseProgramMs) + " ms");
+            Logger::info(std::string("First glDrawArrays time: ") + std::to_string(firstDrawMs) + " ms");
+            firstFrame = false;
+        }
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -425,111 +490,183 @@ std::vector<Triangle> combineTriangles(const Scene& scene) {
     return allTriangles;
 }
 
-void initializeSSBOs(const Scene& scene) {
-    // Combine triangles from all meshes into a single global buffer
-    std::vector<Triangle> allTriangles;
-    std::vector<BVH> meshBLAS;
-    std::vector<BVHInstance> meshInstances;
-    std::vector<BVHNode> meshRootNodes;
-    int nodeOffset = 0, triOffset = 0, globalTriOffset = 0;
-    for (size_t i = 0; i < scene.meshes.size(); ++i) {
-        const auto& mesh = scene.meshes[i];
-        int meshTriStart = allTriangles.size();
-        std::vector<Triangle> transformedTris;
-        for (const auto& tri : mesh.triangles) {
-            Triangle transformed;
-            transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
-            transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
-            transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
-            transformed.materialIndex = tri.materialIndex;
-            transformedTris.push_back(transformed);
-        }
-        // Build BLAS for this mesh using transformed triangles!
-        BVH blas;
-        blas.buildBLAS(transformedTris);
-        // Append transformed triangles to the global triangle buffer
-        allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
-        meshRootNodes.push_back(blas.nodes[0]);
-        BVHInstance inst;
-        inst.blasNodeOffset = nodeOffset;
-        inst.blasTriOffset = triOffset;
-        inst.meshIndex = (int)i;
-        inst.globalTriOffset = meshTriStart; // NEW: store global triangle offset
-        inst.transform = mesh.transform;
-        meshInstances.push_back(inst);
-        nodeOffset += blas.nodes.size();
-        triOffset += blas.triIndices.size();
-        meshBLAS.push_back(std::move(blas));
+void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
+    // Cache directory
+    std::string cacheDir = "bvh_cache/";
+    if (!fs::exists(cacheDir)) {
+        fs::create_directory(cacheDir);
+        Logger::info("Created BVH cache directory: " + cacheDir);
     }
-    // Build TLAS
-    BVH tlas;
-    tlas.buildTLAS(meshInstances, meshRootNodes);
-    // Flatten all BLAS nodes/indices for GPU
+
+    // Try to load SSBO-ready data from cache
+    std::vector<Triangle> allTriangles;
     std::vector<BVHNode> allBLASNodes;
     std::vector<int> allBLASTriIndices;
-    for (const auto& blas : meshBLAS) {
-        allBLASNodes.insert(allBLASNodes.end(), blas.nodes.begin(), blas.nodes.end());
-        allBLASTriIndices.insert(allBLASTriIndices.end(), blas.triIndices.begin(), blas.triIndices.end());
+    std::vector<BVHInstance> meshInstances;
+    std::vector<BVHNode> tlasNodes;
+    std::vector<int> tlasTriIndices;
+    bool loadedSSBOCache = false;
+    std::string ssboCachePrefix = cacheDir + "ssbo_";
+    if (!forceRebuildBVH &&
+        fs::exists(ssboCachePrefix + "triangles.bin") &&
+        fs::exists(ssboCachePrefix + "blasnodes.bin") &&
+        fs::exists(ssboCachePrefix + "blastris.bin") &&
+        fs::exists(ssboCachePrefix + "instances.bin") &&
+        fs::exists(ssboCachePrefix + "tlasnodes.bin") &&
+        fs::exists(ssboCachePrefix + "tlastris.bin")) {
+        loadedSSBOCache =
+            loadVectorFromFile(ssboCachePrefix + "triangles.bin", allTriangles) &&
+            loadVectorFromFile(ssboCachePrefix + "blasnodes.bin", allBLASNodes) &&
+            loadVectorFromFile(ssboCachePrefix + "blastris.bin", allBLASTriIndices) &&
+            loadVectorFromFile(ssboCachePrefix + "instances.bin", meshInstances) &&
+            loadVectorFromFile(ssboCachePrefix + "tlasnodes.bin", tlasNodes) &&
+            loadVectorFromFile(ssboCachePrefix + "tlastris.bin", tlasTriIndices);
+        if (loadedSSBOCache) {
+            Logger::info("Loaded SSBO data from cache");
+        }
     }
 
-    // --- DEBUG LOGGING ---
-    Logger::debug("Mesh count: " + std::to_string(scene.meshes.size()));
-    for (size_t i = 0; i < scene.meshes.size(); ++i) {
-        Logger::debug("Mesh " + std::to_string(i) + " triangle count: " + std::to_string(scene.meshes[i].triangles.size()));
+    if (!loadedSSBOCache) {
+        std::vector<BVH> meshBLAS(scene.meshes.size());
+        std::vector<BVHNode> meshRootNodes;
+        int nodeOffset = 0, triOffset = 0;
+        bool loadedAllBLAS = true;
+        meshInstances.clear();
+        allTriangles.clear();
+        // Try to load BLAS for each mesh
+        for (size_t i = 0; i < scene.meshes.size(); ++i) {
+            const auto& mesh = scene.meshes[i];
+            std::string meshName = "mesh" + std::to_string(i);
+            std::string blasBase = cacheDir + meshName;
+            std::vector<Triangle> transformedTris;
+            for (const auto& tri : mesh.triangles) {
+                Triangle transformed;
+                transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
+                transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
+                transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+                transformed.materialIndex = tri.materialIndex;
+                transformedTris.push_back(transformed);
+            }
+            bool loaded = false;
+            if (!forceRebuildBVH && fs::exists(blasBase + ".nodes.bin") && fs::exists(blasBase + ".tris.bin")) {
+                loaded = loadBVHFromFile(blasBase, meshBLAS[i]);
+                if (loaded) {
+                    Logger::info("Loaded BLAS from cache for " + meshName);
+                }
+            }
+            if (!loaded) {
+                Logger::info("Building BLAS from scratch for " + meshName);
+                meshBLAS[i].buildBLAS(transformedTris);
+                saveBVHToFile(blasBase, meshBLAS[i]);
+                Logger::info("Saved BLAS to cache for " + meshName);
+            }
+            allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
+            meshRootNodes.push_back(meshBLAS[i].nodes[0]);
+            BVHInstance inst;
+            inst.blasNodeOffset = nodeOffset;
+            inst.blasTriOffset = triOffset;
+            inst.meshIndex = (int)i;
+            inst.globalTriOffset = allTriangles.size() - transformedTris.size();
+            inst.transform = mesh.transform;
+            meshInstances.push_back(inst);
+            nodeOffset += meshBLAS[i].nodes.size();
+            triOffset += meshBLAS[i].triIndices.size();
+            loadedAllBLAS &= loaded;
+        }
+        // Try to load TLAS and BVHInstances
+        BVH tlas;
+        std::string tlasBase = cacheDir + "scene_tlas";
+        bool loadedTLAS = false;
+        if (!forceRebuildBVH && loadedAllBLAS && fs::exists(tlasBase + ".nodes.bin") && fs::exists(tlasBase + ".tris.bin") && fs::exists(cacheDir + "instances.bin")) {
+            loadedTLAS = loadBVHFromFile(tlasBase, tlas) && loadBVHInstancesFromFile(cacheDir + "instances.bin", meshInstances);
+            if (loadedTLAS) {
+                Logger::info("Loaded TLAS and BVHInstances from cache");
+            }
+        }
+        if (!loadedTLAS) {
+            Logger::info("Building TLAS from scratch");
+            tlas.buildTLAS(meshInstances, meshRootNodes);
+            saveBVHToFile(tlasBase, tlas);
+            saveBVHInstancesToFile(cacheDir + "instances.bin", meshInstances);
+            Logger::info("Saved TLAS and BVHInstances to cache");
+        }
+        // Flatten all BLAS nodes/indices for GPU
+        allBLASNodes.clear();
+        allBLASTriIndices.clear();
+        for (const auto& blas : meshBLAS) {
+            allBLASNodes.insert(allBLASNodes.end(), blas.nodes.begin(), blas.nodes.end());
+            allBLASTriIndices.insert(allBLASTriIndices.end(), blas.triIndices.begin(), blas.triIndices.end());
+        }
+        tlasNodes = tlas.nodes;
+        tlasTriIndices = tlas.triIndices;
+        // Save SSBO-ready data to cache
+        saveVectorToFile(ssboCachePrefix + "triangles.bin", allTriangles);
+        saveVectorToFile(ssboCachePrefix + "blasnodes.bin", allBLASNodes);
+        saveVectorToFile(ssboCachePrefix + "blastris.bin", allBLASTriIndices);
+        saveVectorToFile(ssboCachePrefix + "instances.bin", meshInstances);
+        saveVectorToFile(ssboCachePrefix + "tlasnodes.bin", tlasNodes);
+        saveVectorToFile(ssboCachePrefix + "tlastris.bin", tlasTriIndices);
+        Logger::info("Saved SSBO data to cache");
     }
-    Logger::debug("All triangles count: " + std::to_string(allTriangles.size()));
-    Logger::debug("MeshInstances: " + std::to_string(meshInstances.size()));
-    for (size_t i = 0; i < meshInstances.size(); ++i) {
-        Logger::debug("MeshInstance " + std::to_string(i) + ": nodeOffset=" + std::to_string(meshInstances[i].blasNodeOffset) + ", triOffset=" + std::to_string(meshInstances[i].blasTriOffset));
-    }
-    Logger::debug("BLAS count: " + std::to_string(meshBLAS.size()));
-    for (size_t i = 0; i < meshBLAS.size(); ++i) {
-        Logger::debug("BLAS " + std::to_string(i) + " nodes: " + std::to_string(meshBLAS[i].nodes.size()) + ", tris: " + std::to_string(meshBLAS[i].triIndices.size()));
-    }
-    Logger::debug("TLAS nodes: " + std::to_string(tlas.nodes.size()) + ", TLAS triIndices: " + std::to_string(tlas.triIndices.size()));
-    Logger::debug("allBLASNodes: " + std::to_string(allBLASNodes.size()) + ", allBLASTriIndices: " + std::to_string(allBLASTriIndices.size()));
-    // --- END DEBUG LOGGING ---
 
-    // Create and bind the triangle SSBO
-    glGenBuffers(1, &triangleSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_DYNAMIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
-    // Create and bind the material SSBO
-    glGenBuffers(1, &materialSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.materials.size() * sizeof(Material), scene.materials.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
-    // Create and bind the light SSBO
-    glGenBuffers(1, &lightSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
-    // Create and bind the TLAS node SSBO (binding = 5)
-    glGenBuffers(1, &tlasNodeSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, tlas.nodes.size() * sizeof(BVHNode), tlas.nodes.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
-    // Create and bind the TLAS tri index SSBO (binding = 6)
-    glGenBuffers(1, &tlasTriIdxSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, tlas.triIndices.size() * sizeof(int), tlas.triIndices.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
-    // Create and bind the BLAS node SSBO (binding = 7)
-    glGenBuffers(1, &blasNodeSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
-    // Create and bind the BLAS tri index SSBO (binding = 8)
-    glGenBuffers(1, &blasTriIdxSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
-    // Create and bind the BVHInstance SSBO (binding = 9)
-    glGenBuffers(1, &bvhInstanceSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, meshInstances.size() * sizeof(BVHInstance), meshInstances.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
+    Logger::info("Initializing SSBOs for triangles, materials, lights, BVHs, and instances");
+
+    auto logBufferUpload = [](const char* name, size_t bytes, auto uploadFunc) {
+        auto start = std::chrono::high_resolution_clock::now();
+        uploadFunc();
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        Logger::info(std::string("SSBO upload: ") + name + ", size: " + std::to_string(bytes/1024) + " KB, time: " + std::to_string(ms) + " ms");
+    };
+
+    logBufferUpload("Triangles", allTriangles.size() * sizeof(Triangle), [&]() {
+        glGenBuffers(1, &triangleSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+    });
+    logBufferUpload("Materials", scene.materials.size() * sizeof(Material), [&]() {
+        glGenBuffers(1, &materialSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, scene.materials.size() * sizeof(Material), scene.materials.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+    });
+    logBufferUpload("Lights", scene.lights.size() * sizeof(Light), [&]() {
+        glGenBuffers(1, &lightSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+    });
+    logBufferUpload("TLAS Nodes", tlasNodes.size() * sizeof(BVHNode), [&]() {
+        glGenBuffers(1, &tlasNodeSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasNodes.size() * sizeof(BVHNode), tlasNodes.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
+    });
+    logBufferUpload("TLAS Tri Indices", tlasTriIndices.size() * sizeof(int), [&]() {
+        glGenBuffers(1, &tlasTriIdxSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasTriIndices.size() * sizeof(int), tlasTriIndices.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
+    });
+    logBufferUpload("BLAS Nodes", allBLASNodes.size() * sizeof(BVHNode), [&]() {
+        glGenBuffers(1, &blasNodeSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
+    });
+    logBufferUpload("BLAS Tri Indices", allBLASTriIndices.size() * sizeof(int), [&]() {
+        glGenBuffers(1, &blasTriIdxSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
+    });
+    logBufferUpload("BVH Instances", meshInstances.size() * sizeof(BVHInstance), [&]() {
+        glGenBuffers(1, &bvhInstanceSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, meshInstances.size() * sizeof(BVHInstance), meshInstances.data(), GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
+    });
 }
 
 void updateSSBOs(const Scene& scene) {

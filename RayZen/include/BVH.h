@@ -29,4 +29,7 @@ public:
     void buildBLAS(const std::vector<Triangle>& tris);
     // TLAS build (over mesh AABBs)
     void buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::vector<BVHNode>& meshRootNodes);
+    // BVH serialization
+    bool saveToFile(const std::string& filename) const;
+    bool loadFromFile(const std::string& filename);
 };

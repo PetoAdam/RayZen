@@ -1,6 +1,7 @@
 #include "BVH.h"
 #include <algorithm>
 #include <limits>
+#include <fstream>
 
 struct BVHBuildEntry {
     int nodeIdx;
@@ -119,4 +120,29 @@ void BVH::buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::ve
         stack.push_back({rightIdx, mid, end});
         stack.push_back({leftIdx, start, mid});
     }
+}
+
+bool BVH::saveToFile(const std::string& filename) const {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) return false;
+    size_t nodeCount = nodes.size();
+    size_t triIdxCount = triIndices.size();
+    out.write(reinterpret_cast<const char*>(&nodeCount), sizeof(size_t));
+    out.write(reinterpret_cast<const char*>(nodes.data()), nodeCount * sizeof(BVHNode));
+    out.write(reinterpret_cast<const char*>(&triIdxCount), sizeof(size_t));
+    out.write(reinterpret_cast<const char*>(triIndices.data()), triIdxCount * sizeof(int));
+    return out.good();
+}
+
+bool BVH::loadFromFile(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) return false;
+    size_t nodeCount = 0, triIdxCount = 0;
+    in.read(reinterpret_cast<char*>(&nodeCount), sizeof(size_t));
+    nodes.resize(nodeCount);
+    in.read(reinterpret_cast<char*>(nodes.data()), nodeCount * sizeof(BVHNode));
+    in.read(reinterpret_cast<char*>(&triIdxCount), sizeof(size_t));
+    triIndices.resize(triIdxCount);
+    in.read(reinterpret_cast<char*>(triIndices.data()), triIdxCount * sizeof(int));
+    return in.good();
 }
