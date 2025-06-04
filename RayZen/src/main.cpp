@@ -32,10 +32,14 @@ void updateSSBOs(const Scene& scene);
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
 GLuint triangleSSBO, materialSSBO, lightSSBO;
+GLuint tlasNodeSSBO, tlasTriIdxSSBO, blasNodeSSBO, blasTriIdxSSBO, bvhInstanceSSBO;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
 bool debugShowLights = false;
 bool debugShowBVH = false;
+int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
+int debugSelectedBLAS = 0;
+int debugSelectedTri = 0;
 
 int main() {
     // Print control scheme at startup
@@ -44,6 +48,7 @@ int main() {
     std::cout << "Mouse Drag (LMB): Rotate camera" << std::endl;
     std::cout << "L: Toggle light debug markers" << std::endl;
     std::cout << "B: Toggle BVH wireframe debug" << std::endl;
+    std::cout << "N: Toggle BVH debug mode (TLAS/BLAS)" << std::endl;
     std::cout << "ESC: Quit" << std::endl;
     std::cout << "========================" << std::endl;
 
@@ -113,11 +118,6 @@ int main() {
     };
 
     // Define meshes
-    // Load monkey
-    Mesh monkey;
-    if (monkey.loadFromOBJ("../meshes/monkey.obj", 1)) {
-        scene.meshes.push_back(monkey);
-    }
 
     // Add a large cube under the monkey as a mirror floor
     Mesh floorCube;
@@ -127,6 +127,12 @@ int main() {
         // Move it down so it's under the monkey
         floorCube.transform = glm::translate(floorCube.transform, glm::vec3(0.0f, -3.0f, 0.0f));
         scene.meshes.push_back(floorCube);
+    }
+
+    // Load monkey
+    Mesh monkey;
+    if (monkey.loadFromOBJ("../meshes/monkey.obj", 1)) {
+        scene.meshes.push_back(monkey);
     }
 
     // Define lights
@@ -171,6 +177,70 @@ int main() {
             bKeyPressed = false;
         }
 
+        // Toggle debugBVHMode with 'N' key
+        static bool nKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS) {
+            if (!nKeyPressed) {
+                debugBVHMode = (debugBVHMode + 1) % 2;
+                nKeyPressed = true;
+                std::cout << std::endl << "BVH debug mode: " << (debugBVHMode == 0 ? "TLAS" : "BLAS") << std::endl;
+            }
+        } else {
+            nKeyPressed = false;
+        }
+
+        // Mouse picking for BLAS debug mode
+        if (debugShowBVH && debugBVHMode == 1) {
+            double mouseX, mouseY;
+            glfwGetCursorPos(window, &mouseX, &mouseY);
+            // Convert mouse to NDC
+            float ndcX = 2.0f * float(mouseX) / float(SCR_WIDTH) - 1.0f;
+            float ndcY = 1.0f - 2.0f * float(mouseY) / float(SCR_HEIGHT);
+            // Unproject to world ray
+            glm::vec4 rayClip(ndcX, ndcY, -1.0f, 1.0f);
+            glm::mat4 invProj = glm::inverse(scene.camera.projectionMatrix);
+            glm::mat4 invView = glm::inverse(scene.camera.viewMatrix);
+            glm::vec4 rayEye = invProj * rayClip;
+            rayEye = glm::vec4(rayEye.x, rayEye.y, -1.0f, 0.0f);
+            glm::vec3 rayDir = glm::normalize(glm::vec3(invView * rayEye));
+            glm::vec3 rayOrigin = scene.camera.position;
+            float closestT = 1e30f;
+            int pickedBLAS = -1, pickedTri = -1;
+            for (size_t meshIdx = 0; meshIdx < scene.meshes.size(); ++meshIdx) {
+                const auto& mesh = scene.meshes[meshIdx];
+                glm::mat4 invTransform = glm::inverse(mesh.transform);
+                glm::vec3 localOrigin = glm::vec3(invTransform * glm::vec4(rayOrigin, 1.0f));
+                glm::vec3 localDir = glm::normalize(glm::vec3(invTransform * glm::vec4(rayDir, 0.0f)));
+                for (size_t triIdx = 0; triIdx < mesh.triangles.size(); ++triIdx) {
+                    const auto& tri = mesh.triangles[triIdx];
+                    // Möller–Trumbore intersection
+                    glm::vec3 v0 = tri.v0, v1 = tri.v1, v2 = tri.v2;
+                    glm::vec3 edge1 = v1 - v0;
+                    glm::vec3 edge2 = v2 - v0;
+                    glm::vec3 h = glm::cross(localDir, edge2);
+                    float a = glm::dot(edge1, h);
+                    if (fabs(a) < 1e-6f) continue;
+                    float f = 1.0f / a;
+                    glm::vec3 s = localOrigin - v0;
+                    float u = f * glm::dot(s, h);
+                    if (u < 0.0f || u > 1.0f) continue;
+                    glm::vec3 q = glm::cross(s, edge1);
+                    float v = f * glm::dot(localDir, q);
+                    if (v < 0.0f || u + v > 1.0f) continue;
+                    float t = f * glm::dot(edge2, q);
+                    if (t > 0.0001f && t < closestT) {
+                        closestT = t;
+                        pickedBLAS = (int)meshIdx;
+                        pickedTri = (int)triIdx;
+                    }
+                }
+            }
+            if (pickedBLAS >= 0 && pickedTri >= 0) {
+                debugSelectedBLAS = pickedBLAS;
+                debugSelectedTri = pickedTri;
+            }
+        }
+
         // Update camera aspect ratio and projection matrix each frame
         scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
         scene.camera.updateProjectionMatrix();
@@ -190,6 +260,14 @@ int main() {
         // Set debugShowBVH uniform
         GLint bvhLoc = glGetUniformLocation(shaderProgram, "debugShowBVH");
         glUniform1i(bvhLoc, debugShowBVH ? 1 : 0);
+        // Set debugBVHMode uniform
+        GLint modeLoc = glGetUniformLocation(shaderProgram, "debugBVHMode");
+        glUniform1i(modeLoc, debugBVHMode);
+        // Set debugSelectedBLAS and debugSelectedTri uniforms
+        GLint selBLASLoc = glGetUniformLocation(shaderProgram, "debugSelectedBLAS");
+        glUniform1i(selBLASLoc, debugSelectedBLAS);
+        GLint selTriLoc = glGetUniformLocation(shaderProgram, "debugSelectedTri");
+        glUniform1i(selTriLoc, debugSelectedTri);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -336,57 +414,114 @@ std::vector<Triangle> combineTriangles(const Scene& scene) {
 }
 
 void initializeSSBOs(const Scene& scene) {
-    // Combine triangles from all meshes
-    std::vector<Triangle> allTriangles = combineTriangles(scene);
+    // Combine triangles from all meshes into a single global buffer
+    std::vector<Triangle> allTriangles;
+    std::vector<BVH> meshBLAS;
+    std::vector<BVHInstance> meshInstances;
+    std::vector<BVHNode> meshRootNodes;
+    int nodeOffset = 0, triOffset = 0, globalTriOffset = 0;
+    for (size_t i = 0; i < scene.meshes.size(); ++i) {
+        const auto& mesh = scene.meshes[i];
+        int meshTriStart = allTriangles.size();
+        std::vector<Triangle> transformedTris;
+        for (const auto& tri : mesh.triangles) {
+            Triangle transformed;
+            transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
+            transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
+            transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+            transformed.materialIndex = tri.materialIndex;
+            transformedTris.push_back(transformed);
+        }
+        // Build BLAS for this mesh using transformed triangles!
+        BVH blas;
+        blas.buildBLAS(transformedTris);
+        // Do NOT offset BLAS triangle indices here!
+        // for (auto& idx : blas.triIndices) {
+        //     idx += meshTriStart;
+        // }
+        // Append transformed triangles to the global triangle buffer
+        allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
+        meshRootNodes.push_back(blas.nodes[0]);
+        BVHInstance inst;
+        inst.blasNodeOffset = nodeOffset;
+        inst.blasTriOffset = triOffset;
+        inst.meshIndex = (int)i;
+        inst.globalTriOffset = meshTriStart; // NEW: store global triangle offset
+        inst.transform = mesh.transform;
+        meshInstances.push_back(inst);
+        nodeOffset += blas.nodes.size();
+        triOffset += blas.triIndices.size();
+        meshBLAS.push_back(std::move(blas));
+    }
+    // Build TLAS
+    BVH tlas;
+    tlas.buildTLAS(meshInstances, meshRootNodes);
+    // Flatten all BLAS nodes/indices for GPU
+    std::vector<BVHNode> allBLASNodes;
+    std::vector<int> allBLASTriIndices;
+    for (const auto& blas : meshBLAS) {
+        allBLASNodes.insert(allBLASNodes.end(), blas.nodes.begin(), blas.nodes.end());
+        allBLASTriIndices.insert(allBLASTriIndices.end(), blas.triIndices.begin(), blas.triIndices.end());
+    }
 
-    // Log BVH generation
-    std::cout << "[RayZen] Generating BVH for scene with " << allTriangles.size() << " triangles..." << std::endl;
-
-    // Build BVH
-    BVH bvh;
-    bvh.build(allTriangles);
-
-    // Debug output
-    //std::cout << "Number of triangles: " << allTriangles.size() << std::endl;
-    //for (const auto& tri : allTriangles) {
-    //    std::cout << "Triangle: (" 
-    //              << tri.v0.x << ", " << tri.v0.y << ", " << tri.v0.z << "), ("
-    //              << tri.v1.x << ", " << tri.v1.y << ", " << tri.v1.z << "), ("
-    //              << tri.v2.x << ", " << tri.v2.y << ", " << tri.v2.z << ")"
-    //              << std::endl;
-    //}
+    // --- DEBUG LOGGING ---
+    std::cout << "[DEBUG] Mesh count: " << scene.meshes.size() << std::endl;
+    for (size_t i = 0; i < scene.meshes.size(); ++i) {
+        std::cout << "[DEBUG] Mesh " << i << " triangle count: " << scene.meshes[i].triangles.size() << std::endl;
+    }
+    std::cout << "[DEBUG] All triangles count: " << allTriangles.size() << std::endl;
+    std::cout << "[DEBUG] MeshInstances: " << meshInstances.size() << std::endl;
+    for (size_t i = 0; i < meshInstances.size(); ++i) {
+        std::cout << "[DEBUG] MeshInstance " << i << ": nodeOffset=" << meshInstances[i].blasNodeOffset << ", triOffset=" << meshInstances[i].blasTriOffset << std::endl;
+    }
+    std::cout << "[DEBUG] BLAS count: " << meshBLAS.size() << std::endl;
+    for (size_t i = 0; i < meshBLAS.size(); ++i) {
+        std::cout << "[DEBUG] BLAS " << i << " nodes: " << meshBLAS[i].nodes.size() << ", tris: " << meshBLAS[i].triIndices.size() << std::endl;
+    }
+    std::cout << "[DEBUG] TLAS nodes: " << tlas.nodes.size() << ", TLAS triIndices: " << tlas.triIndices.size() << std::endl;
+    std::cout << "[DEBUG] allBLASNodes: " << allBLASNodes.size() << ", allBLASTriIndices: " << allBLASTriIndices.size() << std::endl;
+    // --- END DEBUG LOGGING ---
 
     // Create and bind the triangle SSBO
     glGenBuffers(1, &triangleSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, allTriangles.size() * sizeof(Triangle), allTriangles.data(), GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
-
     // Create and bind the material SSBO
     glGenBuffers(1, &materialSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, scene.materials.size() * sizeof(Material), scene.materials.data(), GL_STATIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
-
     // Create and bind the light SSBO
     glGenBuffers(1, &lightSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, scene.lights.size() * sizeof(Light), scene.lights.data(), GL_STATIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
-
-    // Create and bind the BVH SSBO
-    GLuint bvhSSBO;
-    glGenBuffers(1, &bvhSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.nodes.size() * sizeof(BVHNode), bvh.nodes.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvhSSBO);
-
-    // Create and bind the BVH triangle index SSBO
-    GLuint bvhTriIdxSSBO;
-    glGenBuffers(1, &bvhTriIdxSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhTriIdxSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh.triIndices.size() * sizeof(int), bvh.triIndices.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, bvhTriIdxSSBO);
+    // Create and bind the TLAS node SSBO (binding = 5)
+    glGenBuffers(1, &tlasNodeSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, tlas.nodes.size() * sizeof(BVHNode), tlas.nodes.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
+    // Create and bind the TLAS tri index SSBO (binding = 6)
+    glGenBuffers(1, &tlasTriIdxSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, tlas.triIndices.size() * sizeof(int), tlas.triIndices.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
+    // Create and bind the BLAS node SSBO (binding = 7)
+    glGenBuffers(1, &blasNodeSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
+    // Create and bind the BLAS tri index SSBO (binding = 8)
+    glGenBuffers(1, &blasTriIdxSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
+    // Create and bind the BVHInstance SSBO (binding = 9)
+    glGenBuffers(1, &bvhInstanceSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, meshInstances.size() * sizeof(BVHInstance), meshInstances.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
 }
 
 void updateSSBOs(const Scene& scene) {
@@ -409,6 +544,13 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
     glm::mat4 invViewMatrix = glm::inverse(scene.camera.viewMatrix);
     glm::mat4 invProjMatrix = glm::inverse(scene.camera.projectionMatrix);
 
+    // Send the number of triangles
+    int totalTriangles = 0;
+    for (const auto& mesh : scene.meshes) {
+        totalTriangles += mesh.triangles.size();
+    }
+    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), totalTriangles);
+
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
     glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(scene.camera.position));
@@ -419,9 +561,13 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
 
-    // Send the number of triangles
-    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), scene.meshes.size() * scene.meshes[0].triangles.size());
+    
 }
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
