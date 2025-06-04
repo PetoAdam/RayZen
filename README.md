@@ -40,7 +40,7 @@ bash install_requirements.sh
 ### Build Instructions
 
 ```bash
-git clone https://github.com/yourusername/RayZen.git
+git clone https://github.com/PetoAdam/RayZen.git
 cd RayZen
 mkdir build && cd build
 cmake ..
