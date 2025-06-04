@@ -14,6 +14,7 @@
 #include "Material.h"
 #include "Mesh.h"
 #include "BVH.h"
+#include "Logger.h"
 
 // Constants
 unsigned int SCR_WIDTH = 800;
@@ -41,20 +42,30 @@ int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
 int debugSelectedBLAS = 0;
 int debugSelectedTri = 0;
 
-int main() {
+int main(int argc, char** argv) {
+    // Parse CLI log level
+    LogLevel logLevel = LogLevel::INFO;
+    if (argc > 1) {
+        std::string lvl = argv[1];
+        if (lvl == "--log=debug") logLevel = LogLevel::DEBUG;
+        else if (lvl == "--log=info") logLevel = LogLevel::INFO;
+        else if (lvl == "--log=error") logLevel = LogLevel::ERROR;
+    }
+    Logger::setLevel(logLevel);
+
     // Print control scheme at startup
-    std::cout << "==== RayZen Controls ====" << std::endl;
-    std::cout << "WASD: Move camera" << std::endl;
-    std::cout << "Mouse Drag (LMB): Rotate camera" << std::endl;
-    std::cout << "L: Toggle light debug markers" << std::endl;
-    std::cout << "B: Toggle BVH wireframe debug" << std::endl;
-    std::cout << "N: Toggle BVH debug mode (TLAS/BLAS)" << std::endl;
-    std::cout << "ESC: Quit" << std::endl;
-    std::cout << "========================" << std::endl;
+    Logger::info("==== RayZen Controls ====");
+    Logger::info("WASD: Move camera");
+    Logger::info("Mouse Drag (LMB): Rotate camera");
+    Logger::info("L: Toggle light debug markers");
+    Logger::info("B: Toggle BVH wireframe debug");
+    Logger::info("N: Toggle BVH debug mode (TLAS/BLAS)");
+    Logger::info("ESC: Quit");
+    Logger::info("========================");
 
     // Initialize GLFW
     if (!glfwInit()) {
-        std::cerr << "Failed to initialize GLFW" << std::endl;
+        Logger::error("Failed to initialize GLFW");
         return -1;
     }
 
@@ -64,7 +75,7 @@ int main() {
 
     GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "RayZen", nullptr, nullptr);
     if (window == nullptr) {
-        std::cerr << "Failed to create GLFW window" << std::endl;
+        Logger::error("Failed to create GLFW window");
         glfwTerminate();
         return -1;
     }
@@ -73,7 +84,7 @@ int main() {
     // Initialize GLEW
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
-        std::cerr << "Failed to initialize GLEW" << std::endl;
+        Logger::error("Failed to initialize GLEW");
         return -1;
     }
 
@@ -158,8 +169,7 @@ int main() {
             if (!lKeyPressed) {
                 debugShowLights = !debugShowLights;
                 lKeyPressed = true;
-                // Print debug message on its own line
-                std::cout << std::endl << "Light debugging: " << (debugShowLights ? "On" : "Off") << std::endl;
+                Logger::info(std::string("Light debugging: ") + (debugShowLights ? "On" : "Off"));
             }
         } else {
             lKeyPressed = false;
@@ -171,7 +181,7 @@ int main() {
             if (!bKeyPressed) {
                 debugShowBVH = !debugShowBVH;
                 bKeyPressed = true;
-                std::cout << std::endl << "BVH wireframe debugging: " << (debugShowBVH ? "On" : "Off") << std::endl;
+                Logger::info(std::string("BVH wireframe debugging: ") + (debugShowBVH ? "On" : "Off"));
             }
         } else {
             bKeyPressed = false;
@@ -183,7 +193,7 @@ int main() {
             if (!nKeyPressed) {
                 debugBVHMode = (debugBVHMode + 1) % 2;
                 nKeyPressed = true;
-                std::cout << std::endl << "BVH debug mode: " << (debugBVHMode == 0 ? "TLAS" : "BLAS") << std::endl;
+                Logger::info(std::string("BVH debug mode: ") + (debugBVHMode == 0 ? "TLAS" : "BLAS"));
             }
         } else {
             nKeyPressed = false;
@@ -278,8 +288,10 @@ int main() {
         glfwSwapBuffers(window);
         glfwPollEvents();
 
-        // Print fps on a single line at the bottom of the terminal
-        std::cout << "\033[2K\r" << "FPS: " << 1.0/deltaTime << std::flush;
+        // Print fps on a single line at the bottom of the terminal only in DEBUG mode
+        if (Logger::getLevel() <= LogLevel::DEBUG) {
+            std::cout << "\rFPS: " << (1.0/deltaTime) << "    "  << std::endl;
+        }
     }
 
     // Cleanup
@@ -367,7 +379,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     glGetShaderiv(vertex, GL_COMPILE_STATUS, &success);
     if (!success) {
         glGetShaderInfoLog(vertex, 512, nullptr, infoLog);
-        std::cerr << "Vertex Shader Compilation Error: " << infoLog << std::endl;
+        Logger::error(std::string("Vertex Shader Compilation Error: ") + infoLog);
     }
 
     // Compile fragment shader
@@ -377,7 +389,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     glGetShaderiv(fragment, GL_COMPILE_STATUS, &success);
     if (!success) {
         glGetShaderInfoLog(fragment, 512, nullptr, infoLog);
-        std::cerr << "Fragment Shader Compilation Error: " << infoLog << std::endl;
+        Logger::error(std::string("Fragment Shader Compilation Error: ") + infoLog);
     }
 
     // Link shaders
@@ -388,7 +400,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
     if (!success) {
         glGetProgramInfoLog(shaderProgram, 512, nullptr, infoLog);
-        std::cerr << "Shader Program Linking Error: " << infoLog << std::endl;
+        Logger::error(std::string("Shader Program Linking Error: ") + infoLog);
     }
 
     glDeleteShader(vertex);
@@ -435,10 +447,6 @@ void initializeSSBOs(const Scene& scene) {
         // Build BLAS for this mesh using transformed triangles!
         BVH blas;
         blas.buildBLAS(transformedTris);
-        // Do NOT offset BLAS triangle indices here!
-        // for (auto& idx : blas.triIndices) {
-        //     idx += meshTriStart;
-        // }
         // Append transformed triangles to the global triangle buffer
         allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
         meshRootNodes.push_back(blas.nodes[0]);
@@ -465,21 +473,21 @@ void initializeSSBOs(const Scene& scene) {
     }
 
     // --- DEBUG LOGGING ---
-    std::cout << "[DEBUG] Mesh count: " << scene.meshes.size() << std::endl;
+    Logger::debug("Mesh count: " + std::to_string(scene.meshes.size()));
     for (size_t i = 0; i < scene.meshes.size(); ++i) {
-        std::cout << "[DEBUG] Mesh " << i << " triangle count: " << scene.meshes[i].triangles.size() << std::endl;
+        Logger::debug("Mesh " + std::to_string(i) + " triangle count: " + std::to_string(scene.meshes[i].triangles.size()));
     }
-    std::cout << "[DEBUG] All triangles count: " << allTriangles.size() << std::endl;
-    std::cout << "[DEBUG] MeshInstances: " << meshInstances.size() << std::endl;
+    Logger::debug("All triangles count: " + std::to_string(allTriangles.size()));
+    Logger::debug("MeshInstances: " + std::to_string(meshInstances.size()));
     for (size_t i = 0; i < meshInstances.size(); ++i) {
-        std::cout << "[DEBUG] MeshInstance " << i << ": nodeOffset=" << meshInstances[i].blasNodeOffset << ", triOffset=" << meshInstances[i].blasTriOffset << std::endl;
+        Logger::debug("MeshInstance " + std::to_string(i) + ": nodeOffset=" + std::to_string(meshInstances[i].blasNodeOffset) + ", triOffset=" + std::to_string(meshInstances[i].blasTriOffset));
     }
-    std::cout << "[DEBUG] BLAS count: " << meshBLAS.size() << std::endl;
+    Logger::debug("BLAS count: " + std::to_string(meshBLAS.size()));
     for (size_t i = 0; i < meshBLAS.size(); ++i) {
-        std::cout << "[DEBUG] BLAS " << i << " nodes: " << meshBLAS[i].nodes.size() << ", tris: " << meshBLAS[i].triIndices.size() << std::endl;
+        Logger::debug("BLAS " + std::to_string(i) + " nodes: " + std::to_string(meshBLAS[i].nodes.size()) + ", tris: " + std::to_string(meshBLAS[i].triIndices.size()));
     }
-    std::cout << "[DEBUG] TLAS nodes: " << tlas.nodes.size() << ", TLAS triIndices: " << tlas.triIndices.size() << std::endl;
-    std::cout << "[DEBUG] allBLASNodes: " << allBLASNodes.size() << ", allBLASTriIndices: " << allBLASTriIndices.size() << std::endl;
+    Logger::debug("TLAS nodes: " + std::to_string(tlas.nodes.size()) + ", TLAS triIndices: " + std::to_string(tlas.triIndices.size()));
+    Logger::debug("allBLASNodes: " + std::to_string(allBLASNodes.size()) + ", allBLASTriIndices: " + std::to_string(allBLASTriIndices.size()));
     // --- END DEBUG LOGGING ---
 
     // Create and bind the triangle SSBO
