@@ -66,6 +66,7 @@ layout(std430, binding = 4) buffer BVHTriIdxBuffer {
 
 uniform int numTriangles;
 uniform bool debugShowLights;
+uniform bool debugShowBVH;
 
 out vec4 FragColor;
 
@@ -105,6 +106,48 @@ Ray calculateRay(vec2 uv, vec2 seed) {
     ray_eye = vec4(ray_eye.xy, -1.0, 0.0);
     vec3 ray_world = (camera.invViewMatrix * ray_eye).xyz;
     return Ray(camera.position, normalize(ray_world));
+}
+
+// Helper: HSV to RGB for gradient coloring
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Distance from point p to segment ab
+float distanceToSegment(vec2 p, vec2 a, vec2 b) {
+    vec2 ab = b - a;
+    float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+    return length(p - (a + t * ab));
+}
+
+// Draw wireframe for a single AABB in screen space
+float aabbWireframe(vec3 bmin, vec3 bmax, mat4 viewProj, vec2 fragCoord, float thickness) {
+    // 12 edges of the box
+    vec3 corners[8];
+    corners[0] = vec3(bmin.x, bmin.y, bmin.z);
+    corners[1] = vec3(bmax.x, bmin.y, bmin.z);
+    corners[2] = vec3(bmax.x, bmax.y, bmin.z);
+    corners[3] = vec3(bmin.x, bmax.y, bmin.z);
+    corners[4] = vec3(bmin.x, bmin.y, bmax.z);
+    corners[5] = vec3(bmax.x, bmin.y, bmax.z);
+    corners[6] = vec3(bmax.x, bmax.y, bmax.z);
+    corners[7] = vec3(bmin.x, bmax.y, bmax.z);
+    int edges[24] = int[24](0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7);
+    float minDist = 1e6;
+    for (int i = 0; i < 12; ++i) {
+        vec4 p0 = viewProj * vec4(corners[edges[i*2]], 1.0);
+        vec4 p1 = viewProj * vec4(corners[edges[i*2+1]], 1.0);
+        if (p0.w <= 0.0 || p1.w <= 0.0) continue;
+        vec2 s0 = p0.xy / p0.w * 0.5 + 0.5;
+        vec2 s1 = p1.xy / p1.w * 0.5 + 0.5;
+        s0 *= resolution;
+        s1 *= resolution;
+        float d = distanceToSegment(fragCoord, s0, s1);
+        minDist = min(minDist, d);
+    }
+    return minDist < thickness ? 1.0 : 0.0;
 }
 
 //------------------------------------------------------------------------------
@@ -303,6 +346,10 @@ void main() {
     int maxBounces = 3;
     int numSamples = 2;
 
+    // BVH debug overlay variables
+    float bvhWire = 0.0;
+    vec3 bvhWireColor = vec3(0.0);
+
     for (int samp = 0; samp < numSamples; ++samp) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + samp + 1.0);
         Ray ray = calculateRay(uv, seed);
@@ -310,6 +357,43 @@ void main() {
         vec3 currentDirection = ray.direction;
         vec3 throughput = vec3(1.0);
         bool hitSomething = false;
+
+        // --- BVH wireframe overlay: traverse BVH and accumulate wireframe color ---
+        if (debugShowBVH) {
+            int stack[64];
+            int stackPtr = 0;
+            stack[stackPtr++] = 0; // root node
+            vec3 invDir = 1.0 / ray.direction;
+            int maxLevel = 0;
+            while (stackPtr > 0) {
+                int nidx = stack[--stackPtr];
+                BVHNode node = bvhNodes[nidx];
+                float tmin, tmax;
+                int level = 0;
+                int idx = nidx;
+                while (idx > 0) { idx = (idx - 1) / 2; ++level; }
+                maxLevel = max(maxLevel, level);
+                if (intersectAABB(ray.origin, invDir, node.boundsMin, node.boundsMax, tmin, tmax)) {
+                    // Only draw wireframe at the entry/exit points of the AABB
+                    // Project the 8 corners to screen and draw edges if the ray passes through
+                    float thickness = 1.5;
+                    float w = aabbWireframe(node.boundsMin, node.boundsMax, camera.projectionMatrix * camera.viewMatrix, gl_FragCoord.xy, thickness);
+                    if (w > 0.0) {
+                        float t = float(level) / 8.0;
+                        vec3 grad = hsv2rgb(vec3(0.6 - t * 0.5, 1.0, 1.0));
+                        bvhWireColor = mix(bvhWireColor, grad, w);
+                        bvhWire = max(bvhWire, w);
+                    }
+                    if (node.count > 0) {
+                        // leaf
+                    } else {
+                        stack[stackPtr++] = node.leftFirst;
+                        stack[stackPtr++] = node.leftFirst + 1;
+                    }
+                }
+            }
+        }
+        // --- End BVH wireframe overlay ---
 
         for (int bounce = 0; bounce < maxBounces; ++bounce) {
             vec2 tempseed = seed * float(bounce * bounce) * 12793.46 + float(bounce) * 1423.34;
@@ -371,6 +455,11 @@ void main() {
     }
     color /= float(numSamples);
     color = clamp(color, 0.0, 1.0);
+
+    // Overlay BVH wireframe if enabled
+    if (debugShowBVH && bvhWire > 0.0) {
+        color = mix(color, bvhWireColor, 0.7 * bvhWire);
+    }
 
     // Debug: Render light positions as screen-space markers
     if (debugShowLights) {

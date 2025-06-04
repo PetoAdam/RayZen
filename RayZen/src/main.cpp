@@ -35,6 +35,7 @@ GLuint triangleSSBO, materialSSBO, lightSSBO;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
 bool debugShowLights = false;
+bool debugShowBVH = false;
 
 int main() {
     // Print control scheme at startup
@@ -42,6 +43,7 @@ int main() {
     std::cout << "WASD: Move camera" << std::endl;
     std::cout << "Mouse Drag (LMB): Rotate camera" << std::endl;
     std::cout << "L: Toggle light debug markers" << std::endl;
+    std::cout << "B: Toggle BVH wireframe debug" << std::endl;
     std::cout << "ESC: Quit" << std::endl;
     std::cout << "========================" << std::endl;
 
@@ -142,6 +144,7 @@ int main() {
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
         processInput(window, scene.camera, deltaTime);
+        scene.camera.updateViewMatrix();
 
         // Toggle debugShowLights with 'L' key
         static bool lKeyPressed = false;
@@ -154,6 +157,18 @@ int main() {
             }
         } else {
             lKeyPressed = false;
+        }
+
+        // Toggle debugShowBVH with 'B' key
+        static bool bKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
+            if (!bKeyPressed) {
+                debugShowBVH = !debugShowBVH;
+                bKeyPressed = true;
+                std::cout << std::endl << "BVH wireframe debugging: " << (debugShowBVH ? "On" : "Off") << std::endl;
+            }
+        } else {
+            bKeyPressed = false;
         }
 
         // Update camera aspect ratio and projection matrix each frame
@@ -172,6 +187,9 @@ int main() {
         // Set debugShowLights uniform
         GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
         glUniform1i(debugLoc, debugShowLights ? 1 : 0);
+        // Set debugShowBVH uniform
+        GLint bvhLoc = glGetUniformLocation(shaderProgram, "debugShowBVH");
+        glUniform1i(bvhLoc, debugShowBVH ? 1 : 0);
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
