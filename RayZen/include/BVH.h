@@ -19,12 +19,18 @@ struct BVHInstance {
     glm::mat4 transform; // (optional) for instancing, identity if unused
 };
 
+enum class BVHSplitMethod {
+    Midpoint,
+    SAH
+};
+
 class BVH {
 public:
     std::vector<BVHNode> nodes;
     std::vector<int> triIndices;
     // For TLAS
     std::vector<BVHInstance> instances;
+    BVHSplitMethod splitMethod = BVHSplitMethod::SAH;
     // BLAS build (per mesh)
     void buildBLAS(const std::vector<Triangle>& tris);
     // TLAS build (over mesh AABBs)

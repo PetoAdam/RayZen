@@ -18,6 +18,84 @@ static void computeBounds(const std::vector<Triangle>& tris, const std::vector<i
     }
 }
 
+// Sweep-based SAH for much faster BVH construction
+static int findSAHSplit(const std::vector<Triangle>& tris, const std::vector<int>& triIndices, int start, int end, int& axis, float& splitPos, std::vector<int>& sortedTriIndices) {
+    int bestAxis = -1;
+    float bestCost = std::numeric_limits<float>::max();
+    int bestSplit = -1;
+    float bestSplitPos = 0.0f;
+    int N = end - start;
+    if (N <= 4) return -1;
+    // Compute parent bounds for normalization
+    glm::vec3 parentBMin, parentBMax;
+    computeBounds(tris, triIndices, start, end, parentBMin, parentBMax);
+    float parentArea = 2.0f * (
+        (parentBMax.x - parentBMin.x) * (parentBMax.y - parentBMin.y) +
+        (parentBMax.y - parentBMin.y) * (parentBMax.z - parentBMin.z) +
+        (parentBMax.z - parentBMin.z) * (parentBMax.x - parentBMin.x));
+    for (int a = 0; a < 3; ++a) {
+        // Sort indices by centroid along axis a
+        std::vector<std::pair<float, int>> centroidIdxs(N);
+        for (int i = 0; i < N; ++i) {
+            const Triangle& t = tris[triIndices[start + i]];
+            glm::vec3 centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
+            centroidIdxs[i] = {centroid[a], triIndices[start + i]};
+        }
+        std::sort(centroidIdxs.begin(), centroidIdxs.end());
+        // Precompute left and right bounds
+        std::vector<glm::vec3> leftBMin(N), leftBMax(N), rightBMin(N), rightBMax(N);
+        glm::vec3 bmin = glm::vec3(std::numeric_limits<float>::max());
+        glm::vec3 bmax = glm::vec3(-std::numeric_limits<float>::max());
+        for (int i = 0; i < N; ++i) {
+            const Triangle& t = tris[centroidIdxs[i].second];
+            bmin = glm::min(bmin, glm::min(t.v0, glm::min(t.v1, t.v2)));
+            bmax = glm::max(bmax, glm::max(t.v0, glm::max(t.v1, t.v2)));
+            leftBMin[i] = bmin;
+            leftBMax[i] = bmax;
+        }
+        bmin = glm::vec3(std::numeric_limits<float>::max());
+        bmax = glm::vec3(-std::numeric_limits<float>::max());
+        for (int i = N - 1; i >= 0; --i) {
+            const Triangle& t = tris[centroidIdxs[i].second];
+            bmin = glm::min(bmin, glm::min(t.v0, glm::min(t.v1, t.v2)));
+            bmax = glm::max(bmax, glm::max(t.v0, glm::max(t.v1, t.v2)));
+            rightBMin[i] = bmin;
+            rightBMax[i] = bmax;
+        }
+        // Sweep to find best split
+        for (int i = 1; i < N; ++i) {
+            float leftArea = 2.0f * ((leftBMax[i-1].x - leftBMin[i-1].x) * (leftBMax[i-1].y - leftBMin[i-1].y) +
+                                     (leftBMax[i-1].y - leftBMin[i-1].y) * (leftBMax[i-1].z - leftBMin[i-1].z) +
+                                     (leftBMax[i-1].z - leftBMin[i-1].z) * (leftBMax[i-1].x - leftBMin[i-1].x));
+            float rightArea = 2.0f * ((rightBMax[i].x - rightBMin[i].x) * (rightBMax[i].y - rightBMin[i].y) +
+                                      (rightBMax[i].y - rightBMin[i].y) * (rightBMax[i].z - rightBMin[i].z) +
+                                      (rightBMax[i].z - rightBMin[i].z) * (rightBMax[i].x - rightBMin[i].x));
+            float cost = (leftArea * i + rightArea * (N - i)) / (parentArea + 1e-6f); // normalize
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestAxis = a;
+                bestSplit = i;
+                bestSplitPos = 0.5f * (centroidIdxs[i-1].first + centroidIdxs[i].first);
+            }
+        }
+    }
+    // Output sortedTriIndices for the best axis
+    if (bestAxis != -1) {
+        std::vector<std::pair<float, int>> centroidIdxs(N);
+        for (int i = 0; i < N; ++i) {
+            const Triangle& t = tris[triIndices[start + i]];
+            glm::vec3 centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
+            centroidIdxs[i] = {centroid[bestAxis], triIndices[start + i]};
+        }
+        std::sort(centroidIdxs.begin(), centroidIdxs.end());
+        sortedTriIndices.resize(N);
+        for (int i = 0; i < N; ++i) sortedTriIndices[i] = centroidIdxs[i].second;
+    }
+    axis = bestAxis;
+    splitPos = bestSplitPos;
+    return bestSplit;
+}
+
 void BVH::buildBLAS(const std::vector<Triangle>& tris) {
     triIndices.resize(tris.size());
     for (int i = 0; i < (int)tris.size(); ++i) triIndices[i] = i;
@@ -39,20 +117,52 @@ void BVH::buildBLAS(const std::vector<Triangle>& tris) {
             nodes[nidx].count = count;
             continue;
         }
-        glm::vec3 extent = bmax - bmin;
         int axis = 0;
-        if (extent.y > extent.x && extent.y > extent.z) axis = 1;
-        else if (extent.z > extent.x) axis = 2;
-        float split = 0.5f * (bmin[axis] + bmax[axis]);
+        float split = 0.0f;
         int mid = start;
-        for (int i = start; i < end; ++i) {
-            glm::vec3 centroid = (tris[triIndices[i]].v0 + tris[triIndices[i]].v1 + tris[triIndices[i]].v2) / 3.0f;
-            if (centroid[axis] < split) {
-                std::swap(triIndices[i], triIndices[mid]);
-                ++mid;
+        if (splitMethod == BVHSplitMethod::SAH) {
+            int sahSplit = -1;
+            std::vector<int> sortedTriIndices;
+            // Modified findSAHSplit to also return sortedTriIndices
+            sahSplit = findSAHSplit(tris, triIndices, start, end, axis, split, sortedTriIndices);
+            // Robustness: Only use SAH split if valid, else fallback to midpoint
+            if (sahSplit > 0 && sahSplit < (end - start) && sortedTriIndices.size() == (size_t)(end - start)) {
+                // Copy sortedTriIndices back into triIndices[start:end]
+                for (int i = 0; i < end - start; ++i) {
+                    triIndices[start + i] = sortedTriIndices[i];
+                }
+                mid = start + sahSplit;
+            } else {
+                // fallback to midpoint
+                glm::vec3 extent = bmax - bmin;
+                if (extent.y > extent.x && extent.y > extent.z) axis = 1;
+                else if (extent.z > extent.x) axis = 2;
+                split = 0.5f * (bmin[axis] + bmax[axis]);
+                mid = start;
+                for (int i = start; i < end; ++i) {
+                    glm::vec3 centroid = (tris[triIndices[i]].v0 + tris[triIndices[i]].v1 + tris[triIndices[i]].v2) / 3.0f;
+                    if (centroid[axis] < split) {
+                        std::swap(triIndices[i], triIndices[mid]);
+                        ++mid;
+                    }
+                }
+                if (mid == start || mid == end) mid = start + (count / 2);
             }
+        } else {
+            glm::vec3 extent = bmax - bmin;
+            if (extent.y > extent.x && extent.y > extent.z) axis = 1;
+            else if (extent.z > extent.x) axis = 2;
+            split = 0.5f * (bmin[axis] + bmax[axis]);
+            mid = start;
+            for (int i = start; i < end; ++i) {
+                glm::vec3 centroid = (tris[triIndices[i]].v0 + tris[triIndices[i]].v1 + tris[triIndices[i]].v2) / 3.0f;
+                if (centroid[axis] < split) {
+                    std::swap(triIndices[i], triIndices[mid]);
+                    ++mid;
+                }
+            }
+            if (mid == start || mid == end) mid = start + (count / 2);
         }
-        if (mid == start || mid == end) mid = start + (count / 2);
         int leftIdx = (int)nodes.size();
         int rightIdx = leftIdx + 1;
         nodes[nidx].leftFirst = leftIdx;
