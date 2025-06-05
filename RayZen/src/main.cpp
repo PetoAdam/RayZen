@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
 
     // Add a large cube under the monkey as a mirror floor
     Mesh floorCube;
-    if (floorCube.loadFromOBJ("../meshes/cube.obj", 2)) { // 2 = mirror-like material
+    if (floorCube.loadFromOBJ("../meshes/cube.obj", 0)) {
         // Scale the cube to be large and flatten it to act as a floor
         floorCube.transform = glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f));
         // Move it down so it's under the monkey
@@ -196,20 +196,12 @@ int main(int argc, char** argv) {
         scene.meshes.push_back(monkey);
     }
 
-    // Add a second monkey with red material (index 0), positioned next to the first
+    // Add a second monkey with mirror material (index 2), positioned next to the first
     Mesh monkey2;
-    if (monkey2.loadFromOBJ("../meshes/monkey.obj", 0)) {
+    if (monkey2.loadFromOBJ("../meshes/monkey.obj", 2)) {
         // Move it to the right of the first monkey
         monkey2.transform = glm::translate(glm::mat4(1.0f), glm::vec3(3.5f, 0.0f, 0.0f));
         scene.meshes.push_back(monkey2);
-    }
-
-    // Add a third monkey with green metallic material (index 1), positioned to the left
-    Mesh monkey3;
-    if (monkey3.loadFromOBJ("../meshes/monkey.obj", 4)) {
-        // Move it to the left of the first monkey
-        monkey3.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.5f, 0.0f, 0.0f));
-        scene.meshes.push_back(monkey3);
     }
 
     // Define lights
