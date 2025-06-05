@@ -196,6 +196,22 @@ int main(int argc, char** argv) {
         scene.meshes.push_back(monkey);
     }
 
+    // Add a second monkey with red material (index 0), positioned next to the first
+    Mesh monkey2;
+    if (monkey2.loadFromOBJ("../meshes/monkey.obj", 0)) {
+        // Move it to the right of the first monkey
+        monkey2.transform = glm::translate(glm::mat4(1.0f), glm::vec3(3.5f, 0.0f, 0.0f));
+        scene.meshes.push_back(monkey2);
+    }
+
+    // Add a third monkey with green metallic material (index 1), positioned to the left
+    Mesh monkey3;
+    if (monkey3.loadFromOBJ("../meshes/monkey.obj", 4)) {
+        // Move it to the left of the first monkey
+        monkey3.transform = glm::translate(glm::mat4(1.0f), glm::vec3(-3.5f, 0.0f, 0.0f));
+        scene.meshes.push_back(monkey3);
+    }
+
     // Define lights
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
