@@ -405,7 +405,7 @@ bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out v
 }
 
 // Traverse BLAS for a mesh instance
-bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {
+bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, bool anyHit) {    
     tHit = 1e30;
     bool hit = false;
     int stack[64];
@@ -431,6 +431,7 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
                         normal = tempNormal;
                         materialIndex = tempMat;
                         hit = true;
+                        if (anyHit) return true; // Early exit
                     }
                 }
             }
@@ -443,7 +444,7 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
 }
 
 // Traverse TLAS, return closest hit and mesh instance index
-bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx) {
+bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx, bool anyHit) {
     tHit = 1e30;
     bool hit = false;
     int stack[64];
@@ -464,7 +465,7 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                 float t;
                 vec3 tempHit, tempNormal;
                 int tempMat;
-                if (traverseBLAS(ray, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, t, tempHit, tempNormal, tempMat)) {
+                if (traverseBLAS(ray, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, t, tempHit, tempNormal, tempMat, anyHit)) {
                     if (t < tHit) {
                         tHit = t;
                         hitPoint = tempHit;
@@ -472,6 +473,7 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                         materialIndex = tempMat;
                         instanceIdx = instIdx;
                         hit = true;
+                        if (anyHit) return true; // Early exit
                     }
                 }
             }
@@ -490,7 +492,7 @@ bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance, out float shado
     vec3 tempHit, tempNormal;
     int tempMat;
     Ray shadowRay = Ray(hitPoint, lightDir);
-    if (traverseTLAS(shadowRay, tHit, tempHit, tempNormal, tempMat, tempMat)) {
+    if (traverseTLAS(shadowRay, tHit, tempHit, tempNormal, tempMat, tempMat, true)) {
         if (tHit > 0.001 && tHit < maxDistance) {
             float transparency = materials[tempMat].transparency;
             shadowAttenuation *= transparency;
@@ -547,14 +549,14 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
             attenuation = light.power / (distance * distance);
 
             // Check shadows for point lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, distance, shadowAttenuation))
+            if (isInShadow(hitPoint + lightDir * 0.0001, lightDir, distance, shadowAttenuation))
                 continue;
         } else { // Directional light
             lightDir = normalize(light.positionOrDirection.xyz);
             attenuation = light.power;
 
             // Check shadows for directional lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, 1e30, shadowAttenuation))
+            if (isInShadow(hitPoint + lightDir * 0.0001, lightDir, 1e30, shadowAttenuation))
                 continue;
         }
         attenuation *= shadowAttenuation;
@@ -604,7 +606,7 @@ void main() {
     vec3 tlasColor = vec3(0.0), blasColor = vec3(0.0);
 
     if (debugShowBVH) {
-        overlayBVHWireframe(gl_FragCoord.xy, tlasWire, blasColor, blasWire, blasColor);
+        overlayBVHWireframe(gl_FragCoord.xy, tlasWire, tlasColor, blasWire, blasColor);
     }
 
     for (int samp = 0; samp < numSamples; ++samp) {
@@ -624,7 +626,7 @@ void main() {
             Material hitMaterial;
 
             // Use TLAS/BLAS traversal for intersection
-            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx);
+            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx, false);
             if (!found) {
                 // Skybox: blueish gradient, less bright
                 float t = 0.5 * (normalize(currentDirection).y + 1.0);
