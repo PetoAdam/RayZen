@@ -66,7 +66,6 @@ make
 - `shaders/` — GLSL shaders
 - `meshes/` — Example OBJ meshes
 - `docs/` — Documentation
-- `bvh_cache/` — BVH and SSBO cache files (auto-generated)
 
 ---
 
