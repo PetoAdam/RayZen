@@ -8,9 +8,10 @@
 5. Ray-Primitive Intersection
 6. Physically-Based Materials
 7. Lighting Model
-8. GPU Data Flow and SSBOs
-9. Performance Considerations
-10. References
+8. GPU Data Flow, SSBOs, and Caching
+9. Debug Features and Dynamic Scenes
+10. Performance Considerations
+11. References
 
 ---
 
@@ -20,9 +21,9 @@ RayZen is a real-time path tracer leveraging OpenGL compute and fragment shaders
 ---
 
 ## 2. System Architecture
-- **C++ Core**: Scene setup, mesh loading, BVH construction, and OpenGL resource management.
+- **C++ Core**: Scene setup, mesh loading, BVH construction, dynamic scene management, and OpenGL resource management.
 - **GLSL Shaders**: Path tracing, BVH traversal, and physically-based shading.
-- **Data Flow**: Scene data is uploaded to the GPU via Shader Storage Buffer Objects (SSBOs).
+- **Data Flow**: Scene data is uploaded to the GPU via Shader Storage Buffer Objects (SSBOs). BVH and triangle data are cached to disk for fast startup.
 
 ---
 
@@ -51,7 +52,9 @@ Where:
 
 ## 4. BVH Construction and Traversal
 - **BVH (Bounding Volume Hierarchy)**: A binary tree where each node contains an AABB (Axis-Aligned Bounding Box) enclosing a subset of triangles.
-- **Construction**: Surface Area Heuristic (SAH) or midpoint splitting is used to partition triangles.
+- **BLAS/TLAS**: Bottom-level BVHs (BLAS) are built per mesh; a top-level BVH (TLAS) is built over mesh instances for instancing and dynamic scenes.
+- **Construction**: Surface Area Heuristic (SAH) or midpoint splitting is used to partition triangles. BVH and triangle data are cached to disk for fast startup.
+- **Dynamic Scenes**: BVH and SSBOs are rebuilt every frame for moving objects.
 - **Traversal**: On the GPU, a stack-based traversal is implemented in GLSL. Only triangles in leaf nodes are tested for intersection.
 
 **AABB Intersection:**
@@ -98,27 +101,39 @@ Given triangle vertices $v_0$, $v_1$, $v_2$ and ray $(o, d)$:
 
 ---
 
-## 8. GPU Data Flow and SSBOs
+## 8. GPU Data Flow, SSBOs, and Caching
 - **Triangles, Materials, Lights, BVH Nodes, and Indices** are uploaded to the GPU as SSBOs.
 - **Shader Bindings**:
     - 0: Triangles
     - 1: Materials
     - 2: Lights
-    - 3: BVH Nodes
-    - 4: BVH Triangle Indices
+    - 5: TLAS Nodes
+    - 6: TLAS Triangle Indices
+    - 7: BLAS Nodes
+    - 8: BLAS Triangle Indices
+    - 9: BVH Instances
+- **BVH/SSBO Caching**: BVH and triangle data are cached to `build/bvh_cache/` for fast startup. If geometry or transforms change, the cache is rebuilt.
 - **Camera and other uniforms** are sent per-frame.
 
 ---
 
-## 9. Performance Considerations
+## 9. Debug Features and Dynamic Scenes
+- **Debug Overlays**: Toggle light markers, BVH wireframes, and BLAS/TLAS debug modes with keyboard shortcuts (L, B, N).
+- **Dynamic Scene Support**: BVH and SSBOs are rebuilt every frame for moving objects and animated meshes.
+- **Performance Logging**: Shader compile times, buffer upload times, and FPS are logged to the terminal.
+
+---
+
+## 10. Performance Considerations
 - **BVH**: Reduces intersection tests from $O(N)$ to $O(\log N)$ per ray.
 - **GPU Parallelism**: Each pixel is computed independently in the fragment shader.
 - **Dynamic Scenes**: For moving meshes, the BVH must be rebuilt and re-uploaded each frame.
+- **SSBO Caching**: Reduces startup time by reusing previous BVH/triangle data if geometry is unchanged.
 - **Russian Roulette**: Used to probabilistically terminate low-contribution paths.
 
 ---
 
-## 10. References
+## 11. References
 - [Physically Based Rendering: From Theory to Implementation](https://www.pbr-book.org/)
 - [Real-Time Rendering, 4th Edition](https://www.realtimerendering.com/)
 - [Möller–Trumbore Intersection Algorithm](https://en.wikipedia.org/wiki/Möller–Trumbore_intersection_algorithm)
