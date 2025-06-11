@@ -64,8 +64,42 @@ layout(std430, binding = 4) buffer BVHTriIdxBuffer {
     int bvhTriIndices[];
 };
 
+// --- TLAS/BLAS two-level BVH support ---
+
+// TLAS (top-level BVH over mesh instances)
+layout(std430, binding = 5) buffer TLASNodeBuffer {
+    BVHNode tlasNodes[];
+};
+layout(std430, binding = 6) buffer TLASTriIdxBuffer {
+    int tlasTriIndices[];
+};
+
+// BLAS (all mesh BVHs concatenated)
+layout(std430, binding = 7) buffer BLASNodeBuffer {
+    BVHNode blasNodes[];
+};
+layout(std430, binding = 8) buffer BLASTriIdxBuffer {
+    int blasTriIndices[];
+};
+
+// BVHInstance buffer (maps TLAS leaves to BLAS offsets and mesh index)
+struct BVHInstance {
+    int blasNodeOffset;
+    int blasTriOffset;
+    int meshIndex;
+    int globalTriOffset; // Offset into global triangle buffer (NEW)
+    mat4 transform; // (optional, not used if identity)
+};
+layout(std430, binding = 9) buffer BVHInstanceBuffer {
+    BVHInstance bvhInstances[];
+};
+
 uniform int numTriangles;
 uniform bool debugShowLights;
+uniform bool debugShowBVH;
+uniform int debugBVHMode; // 0 = TLAS, 1 = BLAS
+uniform int debugSelectedBLAS; // mesh index
+uniform int debugSelectedTri; // triangle index within mesh
 
 out vec4 FragColor;
 
@@ -77,6 +111,73 @@ struct Ray {
     vec3 origin;
     vec3 direction;
 };
+
+// FPS overlay font: 8x8 bitmap for digits 0-9 and '.' (11 chars)
+// Each row is a byte, LSB is leftmost pixel
+const int fontWidth = 8;
+const int fontHeight = 8;
+const int fontChars = 11; // 0-9 and '.'
+const int fontData[11][8] = int[11][8](
+    // '0'
+    int[8](0x3C,0x66,0x6E,0x7E,0x76,0x66,0x3C,0x00),
+    // '1'
+    int[8](0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0x00),
+    // '2'
+    int[8](0x3C,0x66,0x06,0x1C,0x30,0x66,0x7E,0x00),
+    // '3'
+    int[8](0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00),
+    // '4'
+    int[8](0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00),
+    // '5'
+    int[8](0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00),
+    // '6'
+    int[8](0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00),
+    // '7'
+    int[8](0x7E,0x66,0x0C,0x18,0x18,0x18,0x18,0x00),
+    // '8'
+    int[8](0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00),
+    // '9'
+    int[8](0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00),
+    // '.'
+    int[8](0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00)
+);
+
+// FPS uniform
+uniform float uniformFps;
+
+// Draw a single font character at pixel position (top-left), returns 1.0 if inside glyph, else 0.0
+float drawFontChar(int charIdx, vec2 fragCoord, vec2 pos, float scale) {
+    // Flip y for top-left origin
+    vec2 rel = (fragCoord - pos) / scale;
+    int x = int(rel.x);
+    int y = fontHeight - 1 - int(rel.y); // flip y
+    if (x < 0 || x >= fontWidth || y < 0 || y >= fontHeight) return 0.0;
+    int row = fontData[charIdx][y];
+    int mask = 1 << (fontWidth - 1 - x); // flip x for correct left-to-right
+    return float((row & mask) != 0);
+}
+
+// Draw a string of up to 8 chars (digits and '.') at pos, returns color overlay
+vec3 drawFpsString(vec2 fragCoord, vec2 pos, float scale, float fps, vec3 fg, vec3 bg) {
+    // Always draw as 3 digits, decimal, 1 digit: e.g. 042.7
+    int fpsInt = int(fps);
+    int tenths = int(fract(fps) * 10.0);
+    int hundreds = (fpsInt / 100) % 10;
+    int tens = (fpsInt / 10) % 10;
+    int ones = fpsInt % 10;
+    int chars[5];
+    chars[0] = hundreds;
+    chars[1] = tens;
+    chars[2] = ones;
+    chars[3] = 10; // '.'
+    chars[4] = tenths;
+    vec3 col = bg;
+    for (int i = 0; i < 5; ++i) {
+        float glyph = drawFontChar(chars[i], fragCoord, pos + vec2(i * (fontWidth+1) * scale, 0.0), scale);
+        col = mix(col, fg, glyph);
+    }
+    return col;
+}
 
 //------------------------------------------------------------------------------
 // Utility functions
@@ -107,10 +208,178 @@ Ray calculateRay(vec2 uv, vec2 seed) {
     return Ray(camera.position, normalize(ray_world));
 }
 
+// Helper: HSV to RGB for gradient coloring
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Distance from point p to segment ab
+float distanceToSegment(vec2 p, vec2 a, vec2 b) {
+    vec2 ab = b - a;
+    float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+    return length(p - (a + t * ab));
+}
+
+// Draw wireframe for a single AABB in screen space
+float aabbWireframe(vec3 bmin, vec3 bmax, mat4 viewProj, vec2 fragCoord, float thickness) {
+    // 12 edges of the box
+    vec3 corners[8];
+    corners[0] = vec3(bmin.x, bmin.y, bmin.z);
+    corners[1] = vec3(bmax.x, bmin.y, bmin.z);
+    corners[2] = vec3(bmax.x, bmax.y, bmin.z);
+    corners[3] = vec3(bmin.x, bmax.y, bmin.z);
+    corners[4] = vec3(bmin.x, bmin.y, bmax.z);
+    corners[5] = vec3(bmax.x, bmin.y, bmax.z);
+    corners[6] = vec3(bmax.x, bmax.y, bmax.z);
+    corners[7] = vec3(bmin.x, bmax.y, bmax.z);
+    int edges[24] = int[24](0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7);
+    float minDist = 1e6;
+    for (int i = 0; i < 12; ++i) {
+        vec4 p0 = viewProj * vec4(corners[edges[i*2]], 1.0);
+        vec4 p1 = viewProj * vec4(corners[edges[i*2+1]], 1.0);
+        if (p0.w <= 0.0 || p1.w <= 0.0) continue;
+        vec2 s0 = p0.xy / p0.w * 0.5 + 0.5;
+        vec2 s1 = p1.xy / p1.w * 0.5 + 0.5;
+        s0 *= resolution;
+        s1 *= resolution;
+        float d = distanceToSegment(fragCoord, s0, s1);
+        minDist = min(minDist, d);
+    }
+    return minDist < thickness ? 1.0 : 0.0;
+}
+
+// Helper: robust iterative search for path from root to leaf containing selectedTri in BLAS
+void findBVHBranchIterative(int nodeOffset, int triOffset, int nodeCount, int selectedTri, out int path[32], out int pathLen) {
+    int cur = 0;
+    pathLen = 0;
+    for (int depth = 0; depth < 32; ++depth) {
+        path[pathLen++] = cur;
+        BVHNode node = blasNodes[nodeOffset + cur];
+        if (node.count > 0) { // leaf
+            bool found = false;
+            for (int i = 0; i < node.count; ++i) {
+                int triIdx = blasTriIndices[triOffset + node.leftFirst + i];
+                if (triIdx == selectedTri) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) pathLen = 0; // not found in this leaf
+            break;
+        } else {
+            // Internal: check both children for selectedTri
+            int leftIdx = node.leftFirst;
+            int rightIdx = node.leftFirst + 1;
+            bool foundInLeft = false;
+            // Search left subtree for selectedTri
+            int stack[32]; int sp = 0;
+            stack[sp++] = leftIdx;
+            while (sp > 0) {
+                int nidx = stack[--sp];
+                if (nidx < 0 || nidx >= nodeCount) continue;
+                BVHNode n = blasNodes[nodeOffset + nidx];
+                if (n.count > 0) {
+                    for (int j = 0; j < n.count; ++j) {
+                        int triIdx = blasTriIndices[triOffset + n.leftFirst + j];
+                        if (triIdx == selectedTri) {
+                            foundInLeft = true;
+                            break;
+                        }
+                    }
+                } else {
+                    stack[sp++] = n.leftFirst;
+                    stack[sp++] = n.leftFirst + 1;
+                }
+                if (foundInLeft) break;
+            }
+            if (foundInLeft) {
+                cur = leftIdx;
+            } else {
+                cur = rightIdx;
+            }
+        }
+    }
+}
+
+// BVH wireframe overlay for TLAS and BLAS
+void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor, out float blasWire, out vec3 blasColor) {
+    tlasWire = 0.0;
+    tlasColor = vec3(0.0);
+    blasWire = 0.0;
+    blasColor = vec3(0.0);
+    if (debugBVHMode == 0) {
+        // TLAS overlay
+        for (int i = 0; i < 32; ++i) {
+            if (i >= tlasNodes.length()) break;
+            BVHNode node = tlasNodes[i];
+            float w = aabbWireframe(node.boundsMin, node.boundsMax, camera.projectionMatrix * camera.viewMatrix, fragCoord, 1.5);
+            if (w > 0.0) {
+                float t = float(i) / 32.0;
+                vec3 grad = hsv2rgb(vec3(0.0 + t * 0.5, 1.0, 1.0));
+                tlasColor = mix(tlasColor, grad, w);
+                tlasWire = max(tlasWire, w);
+            }
+        }
+        // BLAS overlay: draw the root node of each mesh's BLAS for clear debugging
+        for (int i = 0; i < bvhInstances.length(); ++i) {
+            int rootIdx = bvhInstances[i].blasNodeOffset;
+            BVHNode node = blasNodes[rootIdx];
+            float w = aabbWireframe(node.boundsMin, node.boundsMax, camera.projectionMatrix * camera.viewMatrix, fragCoord, 2.0);
+            if (w > 0.0) {
+                float t = float(i) / float(bvhInstances.length());
+                vec3 grad = hsv2rgb(vec3(0.6 - t * 0.5, 1.0, 1.0));
+                blasColor = mix(blasColor, grad, w);
+                blasWire = max(blasWire, w);
+            }
+        }
+    } else if (debugBVHMode == 1) {
+        // BLAS mode: draw only the BVH branch for the selected triangle in the selected BLAS
+        int selectedBLAS = debugSelectedBLAS;
+        int selectedTri = debugSelectedTri;
+        int nodeOffset = bvhInstances[selectedBLAS].blasNodeOffset;
+        int triOffset = bvhInstances[selectedBLAS].blasTriOffset;
+        int nodeCount = 0;
+        if (selectedBLAS + 1 < bvhInstances.length()) {
+            nodeCount = bvhInstances[selectedBLAS + 1].blasNodeOffset - nodeOffset;
+        } else {
+            nodeCount = blasNodes.length() - nodeOffset;
+        }
+        int path[32]; int pathLen = 0;
+        findBVHBranchIterative(nodeOffset, triOffset, nodeCount, selectedTri, path, pathLen);
+        // Fetch the instance transform for this BLAS
+        mat4 instanceTransform = bvhInstances[selectedBLAS].transform;
+        mat4 viewProj = camera.projectionMatrix * camera.viewMatrix;
+        for (int i = 0; i < pathLen; ++i) {
+            BVHNode node = blasNodes[nodeOffset + path[i]];
+            // Transform AABB corners to world space using instanceTransform
+            vec3 bmin = (instanceTransform * vec4(node.boundsMin, 1.0)).xyz;
+            vec3 bmax = (instanceTransform * vec4(node.boundsMax, 1.0)).xyz;
+            float wire = aabbWireframe(bmin, bmax, viewProj, fragCoord, 2.0);
+            blasWire = max(blasWire, wire);
+            float hue = float(i) / float(pathLen);
+            blasColor = mix(blasColor, hsv2rgb(vec3(hue, 1.0, 1.0)), wire);
+        }
+    }
+}
+
 //------------------------------------------------------------------------------
-// Intersection functions
+// Intersection functions for TLAS/BLAS
 //------------------------------------------------------------------------------
-// Möller–Trumbore algorithm for triangle intersection.
+
+// Ray-AABB intersection
+bool intersectAABB(vec3 rayOrig, vec3 rayDirInv, vec3 bmin, vec3 bmax, out float tmin, out float tmax) {
+    vec3 t0 = (bmin - rayOrig) * rayDirInv;
+    vec3 t1 = (bmax - rayOrig) * rayDirInv;
+    vec3 tsmaller = min(t0, t1);
+    vec3 tbigger = max(t0, t1);
+    tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+    tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
+    return tmax >= max(tmin, 0.0);
+}
+
+// Möller–Trumbore algorithm for triangle intersection
 bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {
     vec3 edge1 = tri.v1 - tri.v0;
     vec3 edge2 = tri.v2 - tri.v0;
@@ -138,34 +407,23 @@ bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out v
     return false;
 }
 
-// Ray-AABB intersection
-bool intersectAABB(vec3 rayOrig, vec3 rayDirInv, vec3 bmin, vec3 bmax, out float tmin, out float tmax) {
-    vec3 t0 = (bmin - rayOrig) * rayDirInv;
-    vec3 t1 = (bmax - rayOrig) * rayDirInv;
-    vec3 tsmaller = min(t0, t1);
-    vec3 tbigger = max(t0, t1);
-    tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
-    tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
-    return tmax >= max(tmin, 0.0);
-}
-
-// BVH traversal for closest hit
-bool traverseBVH(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {
+// Traverse BLAS for a mesh instance
+bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, bool anyHit) {    
     tHit = 1e30;
     bool hit = false;
     int stack[64];
     int stackPtr = 0;
-    stack[stackPtr++] = 0; // root node
+    stack[stackPtr++] = 0; // root node of this BLAS
     vec3 invDir = 1.0 / ray.direction;
     while (stackPtr > 0) {
         int nidx = stack[--stackPtr];
-        BVHNode node = bvhNodes[nidx];
+        BVHNode node = blasNodes[blasNodeOffset + nidx];
         float tmin, tmax;
         if (!intersectAABB(ray.origin, invDir, node.boundsMin, node.boundsMax, tmin, tmax) || tmin > tHit)
             continue;
         if (node.count > 0) { // leaf
             for (int i = 0; i < node.count; ++i) {
-                int triIdx = bvhTriIndices[node.leftFirst + i];
+                int triIdx = globalTriOffset + blasTriIndices[blasTriOffset + node.leftFirst + i];
                 float t;
                 vec3 tempHit, tempNormal;
                 int tempMat;
@@ -176,6 +434,7 @@ bool traverseBVH(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, ou
                         normal = tempNormal;
                         materialIndex = tempMat;
                         hit = true;
+                        if (anyHit) return true; // Early exit
                     }
                 }
             }
@@ -187,14 +446,63 @@ bool traverseBVH(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, ou
     return hit;
 }
 
-// Shadow test: cast a ray from hitPoint along lightDir and check for occlusion
+// Traverse TLAS, return closest hit and mesh instance index
+bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx, bool anyHit) {
+    tHit = 1e30;
+    bool hit = false;
+    int stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // root node
+    vec3 invDir = 1.0 / ray.direction;
+    while (stackPtr > 0) {
+        int nidx = stack[--stackPtr];
+        BVHNode node = tlasNodes[nidx];
+        float tmin, tmax;
+        if (!intersectAABB(ray.origin, invDir, node.boundsMin, node.boundsMax, tmin, tmax) || tmin > tHit)
+            continue;
+        if (node.count > 0) { // leaf: contains mesh instance indices
+            for (int i = 0; i < node.count; ++i) {
+                int instIdx = tlasTriIndices[node.leftFirst + i];
+                BVHInstance inst = bvhInstances[instIdx];
+                // Transform ray to mesh local space using inverse(instance.transform)
+                mat4 invTransform = inverse(inst.transform);
+                vec3 localOrigin = vec3(invTransform * vec4(ray.origin, 1.0));
+                vec3 localDir = normalize(vec3(invTransform * vec4(ray.direction, 0.0)));
+                Ray localRay = Ray(localOrigin, localDir);
+                float tLocal;
+                vec3 localHit, localNormal;
+                int tempMat;
+                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat, anyHit)) {
+                    // Transform hit point and normal back to world space
+                    vec3 worldHit = vec3(inst.transform * vec4(localHit, 1.0));
+                    float tWorld = length(worldHit - ray.origin); // world-space t
+                    if (tWorld < tHit) {
+                        tHit = tWorld;
+                        hitPoint = worldHit;
+                        normal = normalize(mat3(transpose(inverse(inst.transform))) * localNormal);
+                        materialIndex = tempMat;
+                        instanceIdx = instIdx;
+                        hit = true;
+                        if (anyHit) return true; // Early exit
+                    }
+                }
+            }
+        } else { // internal
+            stack[stackPtr++] = node.leftFirst;
+            stack[stackPtr++] = node.leftFirst + 1;
+        }
+    }
+    return hit;
+}
+
+// Shadow test: cast a ray and check for occlusion using TLAS/BLAS
 bool isInShadow(vec3 hitPoint, vec3 lightDir, float maxDistance, out float shadowAttenuation) {
     shadowAttenuation = 1.0;
     float tHit;
     vec3 tempHit, tempNormal;
     int tempMat;
     Ray shadowRay = Ray(hitPoint, lightDir);
-    if (traverseBVH(shadowRay, tHit, tempHit, tempNormal, tempMat)) {
+    if (traverseTLAS(shadowRay, tHit, tempHit, tempNormal, tempMat, tempMat, true)) {
         if (tHit > 0.001 && tHit < maxDistance) {
             float transparency = materials[tempMat].transparency;
             shadowAttenuation *= transparency;
@@ -218,8 +526,6 @@ vec3 reflectRay(vec3 incident, vec3 normal) {
 
 vec3 refractRay(vec3 incident, vec3 normal, float ior) {
     float cosi = clamp(dot(incident, normal), -1.0, 1.0);
-    // TODO: check if this is needed
-    //if (dot(incident, normal) > 0.0) normal = -normal;
     float etai = 1.0, etat = ior;
     vec3 n = normal;
     if (cosi < 0.0) {
@@ -253,14 +559,14 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
             attenuation = light.power / (distance * distance);
 
             // Check shadows for point lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, distance, shadowAttenuation))
+            if (isInShadow(hitPoint + lightDir * 0.0001, lightDir, distance, shadowAttenuation))
                 continue;
         } else { // Directional light
             lightDir = normalize(light.positionOrDirection.xyz);
             attenuation = light.power;
 
             // Check shadows for directional lights
-            if (isInShadow(hitPoint + lightDir * 0.001, lightDir, 1e30, shadowAttenuation))
+            if (isInShadow(hitPoint + lightDir * 0.0001, lightDir, 1e30, shadowAttenuation))
                 continue;
         }
         attenuation *= shadowAttenuation;
@@ -301,7 +607,17 @@ void main() {
 
     vec3 color = vec3(0.0);
     int maxBounces = 3;
-    int numSamples = 2;
+    int numSamples = 1;
+
+    // BVH debug overlay variables
+    float bvhWire = 0.0;
+    vec3 bvhWireColor = vec3(0.0);
+    float tlasWire = 0.0, blasWire = 0.0;
+    vec3 tlasColor = vec3(0.0), blasColor = vec3(0.0);
+
+    if (debugShowBVH) {
+        overlayBVHWireframe(gl_FragCoord.xy, tlasWire, tlasColor, blasWire, blasColor);
+    }
 
     for (int samp = 0; samp < numSamples; ++samp) {
         seed = uv * float(gl_FragCoord.x + gl_FragCoord.y + samp + 1.0);
@@ -315,11 +631,12 @@ void main() {
             vec2 tempseed = seed * float(bounce * bounce) * 12793.46 + float(bounce) * 1423.34;
             vec3 hitPoint, hitNormal;
             int materialIndex = -1;
+            int instanceIdx = -1;
             float closestT = 1e30;
             Material hitMaterial;
 
-            // Use BVH traversal for intersection
-            bool found = traverseBVH(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex);
+            // Use TLAS/BLAS traversal for intersection
+            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx, false);
             if (!found) {
                 // Skybox: blueish gradient, less bright
                 float t = 0.5 * (normalize(currentDirection).y + 1.0);
@@ -342,8 +659,7 @@ void main() {
                 vec3 F = fresnelSchlick(cosi, F0vec);
                 float fresnelProbability = clamp(F.r, 0.0, 1.0);
 
-                //TODO: Check other option?
-                if (randVal > hitMaterial.transparency /*randVal < fresnelProbability * hitMaterial.transparency*/) {
+                if (randVal > hitMaterial.transparency) {
                     currentDirection = reflectRay(currentDirection, hitNormal);
                 } else {
                     //currentDirection = refractRay(currentDirection, hitNormal, hitMaterial.ior);
@@ -372,6 +688,12 @@ void main() {
     color /= float(numSamples);
     color = clamp(color, 0.0, 1.0);
 
+    // Overlay BVH wireframe if enabled
+    if (debugShowBVH && (tlasWire > 0.0 || blasWire > 0.0)) {
+        color = mix(color, tlasColor, 0.5 * tlasWire);
+        color = mix(color, blasColor, 0.5 * blasWire);
+    }
+
     // Debug: Render light positions as screen-space markers
     if (debugShowLights) {
         for (int i = 0; i < 10; ++i) {
@@ -394,5 +716,22 @@ void main() {
             }
         }
     }
+
+    // FPS overlay (top-left, white text, black bg)
+    float margin = 8.0;
+    vec2 fpsPos = vec2(margin, resolution.y - margin - fontHeight * 2.0); // top-left
+    float fpsScale = 2.0; // 2x font size
+    vec3 fpsCol = drawFpsString(gl_FragCoord.xy, fpsPos, fpsScale, uniformFps, vec3(1.0), color);
+    float anyFps = 0.0;
+    for (int y = 0; y < fontHeight; ++y) {
+        for (int x = 0; x < fontWidth * 6; ++x) {
+            vec2 p = fpsPos + vec2(x, y) * fpsScale;
+            if (abs(gl_FragCoord.x - p.x) < 1.0 && abs(gl_FragCoord.y - p.y) < 1.0) {
+                anyFps = 1.0;
+            }
+        }
+    }
+    color = mix(color, fpsCol, anyFps);
+
     FragColor = vec4(color, 1.0);
 }

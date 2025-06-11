@@ -2,22 +2,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-RayZen is a modern, open-source GPU-accelerated path tracer written in C++ and OpenGL. It is designed for real-time physically-based rendering (PBR) of 3D scenes, supporting advanced features such as BVH acceleration, physically-based materials, and interactive camera controls. RayZen is ideal for graphics research, education, and as a foundation for your own renderer.
+RayZen is a modern, open-source GPU-accelerated path tracer written in C++ and OpenGL. It is designed for real-time physically-based rendering (PBR) of 3D scenes, supporting advanced features such as BVH acceleration, dynamic scene support, SSBO caching, debug overlays, and interactive camera controls. RayZen is ideal for graphics research, education, and as a foundation for your own renderer.
 
 ![Preview](./docs/resources/preview.png)
-
-
 
 ---
 
 ## Features
 
 - **Real-Time Path Tracing**: Physically-based global illumination using GPU fragment shaders.
-- **BVH Acceleration**: Fast ray traversal using a Bounding Volume Hierarchy for high performance.
+- **BVH Acceleration**: Fast ray traversal using a Bounding Volume Hierarchy (BLAS/TLAS) for high performance.
+- **Dynamic Scene Support**: BVH and SSBOs are rebuilt on-the-fly for moving objects.
+- **SSBO Caching**: BVH and triangle data are cached to disk for fast startup.
 - **Physically-Based Materials**: Support for metallic, dielectric, rough, and transparent materials.
 - **Multiple Light Types**: Point and directional lights.
 - **OBJ Mesh Loading**: Import and render standard OBJ meshes.
 - **Interactive Camera**: WASD movement and mouse look.
+- **Debug Overlays**: Toggle light markers, BVH wireframes, and BLAS/TLAS debug modes.
 - **Modular C++ Design**: Clean, extensible codebase.
 
 ---
@@ -48,9 +49,12 @@ make
 ./RayZen
 ```
 
-### Controls
+### Controls & Debug
 - **WASD**: Move camera
 - **Mouse Drag (LMB)**: Rotate camera
+- **L**: Toggle light debug markers
+- **B**: Toggle BVH wireframe debug
+- **N**: Toggle BVH debug mode (TLAS/BLAS)
 - **ESC**: Exit
 
 ---

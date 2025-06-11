@@ -1,12 +1,12 @@
 #include "Mesh.h"
+#include "Logger.h"
 #include <fstream>
 #include <sstream>
-#include <iostream>
 
 bool Mesh::loadFromOBJ(const std::string& filename, int materialIndex) {
     std::ifstream file(filename);
     if (!file.is_open()) {
-        std::cerr << "Failed to open OBJ file: " << filename << std::endl;
+        Logger::error("Failed to open OBJ file: " + filename);
         return false;
     }
     
@@ -45,6 +45,6 @@ bool Mesh::loadFromOBJ(const std::string& filename, int materialIndex) {
             }
         }
     }
-    std::cout << "Loaded " << triangles.size() << " triangles." << std::endl;
+    Logger::debug("Loaded " + std::to_string(triangles.size()) + " triangles.");
     return true;
 }

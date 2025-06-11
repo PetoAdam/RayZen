@@ -27,6 +27,6 @@ public:
     glm::vec3 getColor() const {
         return color;
     }
-} __attribute__((std430));
+};
 
 #endif
