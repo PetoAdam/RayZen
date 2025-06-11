@@ -9,6 +9,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <filesystem>
 #include <chrono>
+#include <memory>
 
 #include "Ray.h"
 #include "Scene.h"
@@ -17,6 +18,7 @@
 #include "Mesh.h"
 #include "BVH.h"
 #include "Logger.h"
+#include "GameObject.h"
 
 namespace fs = std::filesystem;
 
@@ -31,7 +33,7 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 void initializeSSBOs(const Scene& scene, bool forceRebuildBVH = false);
-void updateSSBOs(const Scene& scene);
+void updateDynamicBVHAndSSBOs(Scene& scene);
 
 // Global variables
 GLuint quadVAO, quadVBO;
@@ -151,7 +153,7 @@ int main(int argc, char** argv) {
     setupQuad(quadVAO, quadVBO);
 
     // Define scene
-    Scene scene = Scene();
+    Scene scene;
 
     // Define camera
     scene.camera = Camera(
@@ -178,42 +180,34 @@ int main(int argc, char** argv) {
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
 
-    // Define meshes
-
-    // Add a large cube under the monkey as a mirror floor
-    Mesh floorCube;
-    if (floorCube.loadFromOBJ("../meshes/cube.obj", 0)) {
-        // Scale the cube to be large and flatten it to act as a floor
-        floorCube.transform = glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f));
-        // Move it down so it's under the monkey
-        floorCube.transform = glm::translate(floorCube.transform, glm::vec3(0.0f, -3.0f, 0.0f));
-        scene.meshes.push_back(floorCube);
-    }
-
-    // Load monkey
-    Mesh monkey;
-    if (monkey.loadFromOBJ("../meshes/monkey.obj", 1)) {
-        scene.meshes.push_back(monkey);
-    }
-
-    // Add a second monkey with mirror material (index 2), positioned next to the first
-    Mesh monkey2;
-    if (monkey2.loadFromOBJ("../meshes/monkey.obj", 2)) {
-        // Move it to the right of the first monkey
-        monkey2.transform = glm::translate(glm::mat4(1.0f), glm::vec3(3.5f, 0.0f, 0.0f));
-        scene.meshes.push_back(monkey2);
-    }
-
     // Define lights
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
 
-    // Initialize SSBOs
+    // Define game objects
+    // Create shared meshes
+    auto floorMesh = std::make_shared<Mesh>();
+    auto monkeyMesh = std::make_shared<Mesh>();
+    auto monkey2Mesh = std::make_shared<Mesh>();
+    auto movingCubeMesh = std::make_shared<Mesh>();
+    floorMesh->loadFromOBJ("../meshes/cube.obj", 0);
+    monkeyMesh->loadFromOBJ("../meshes/monkey.obj", 1);
+    monkey2Mesh->loadFromOBJ("../meshes/monkey.obj", 2);
+    movingCubeMesh->loadFromOBJ("../meshes/cube.obj", 1);
+
+    // Add GameObjects to the scene
+    scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, 0.0f))});
+
+    // Initialize SSBOs (initial build)
     initializeSSBOs(scene, forceRebuildBVH);
 
     // Main render loop
     bool firstFrame = true;
     double firstUseProgramMs = 0.0, firstDrawMs = 0.0;
+    float animTime = 0.0f;
     while (!glfwWindowShouldClose(window)) {
 
         // Calculate delta time
@@ -276,13 +270,14 @@ int main(int argc, char** argv) {
             glm::vec3 rayOrigin = scene.camera.position;
             float closestT = 1e30f;
             int pickedBLAS = -1, pickedTri = -1;
-            for (size_t meshIdx = 0; meshIdx < scene.meshes.size(); ++meshIdx) {
-                const auto& mesh = scene.meshes[meshIdx];
-                glm::mat4 invTransform = glm::inverse(mesh.transform);
+            for (size_t objIdx = 0; objIdx < scene.gameObjects.size(); ++objIdx) {
+                const auto& obj = scene.gameObjects[objIdx];
+                const auto& mesh = obj.mesh;
+                glm::mat4 invTransform = glm::inverse(obj.transform);
                 glm::vec3 localOrigin = glm::vec3(invTransform * glm::vec4(rayOrigin, 1.0f));
                 glm::vec3 localDir = glm::normalize(glm::vec3(invTransform * glm::vec4(rayDir, 0.0f)));
-                for (size_t triIdx = 0; triIdx < mesh.triangles.size(); ++triIdx) {
-                    const auto& tri = mesh.triangles[triIdx];
+                for (size_t triIdx = 0; triIdx < mesh->triangles.size(); ++triIdx) {
+                    const auto& tri = mesh->triangles[triIdx];
                     // Möller–Trumbore intersection
                     glm::vec3 v0 = tri.v0, v1 = tri.v1, v2 = tri.v2;
                     glm::vec3 edge1 = v1 - v0;
@@ -300,7 +295,7 @@ int main(int argc, char** argv) {
                     float t = f * glm::dot(edge2, q);
                     if (t > 0.0001f && t < closestT) {
                         closestT = t;
-                        pickedBLAS = (int)meshIdx;
+                        pickedBLAS = (int)objIdx;
                         pickedTri = (int)triIdx;
                     }
                 }
@@ -318,8 +313,18 @@ int main(int argc, char** argv) {
         // Rotate the first cube
         //scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
 
-        // Update SSBOs with the transformed vertex data
-        updateSSBOs(scene);
+        // Animate the moving cube (last in gameObjects)
+        animTime += deltaTime;
+        if (!scene.gameObjects.empty()) {
+            // Animate the last object (moving cube)
+            GameObject& movingCube = scene.gameObjects.back();
+            float x = -2.0f + 2.0f * sin(animTime);
+            float y = 0.5f + 0.5f * cos(animTime * 0.5f);
+            movingCube.transform = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f));
+        }
+
+        // Update dynamic BVH/SSBOs for game objects
+        updateDynamicBVHAndSSBOs(scene);
 
         // Send scene data to the shader
         sendSceneDataToShader(shaderProgram, scene);
@@ -492,13 +497,13 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
 
 std::vector<Triangle> combineTriangles(const Scene& scene) {
     std::vector<Triangle> allTriangles;
-    for (const auto& mesh : scene.meshes) {
-        for (const auto& tri : mesh.triangles) {
+    for (const auto& obj : scene.gameObjects) {
+        for (const auto& tri : obj.mesh->triangles) {
             Triangle transformed;
-            // Transform each vertex (assumes the mesh.transform is rotation/translation/uniform scale)
-            transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
-            transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
-            transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+            // Transform each vertex (assumes the obj.transform is rotation/translation/uniform scale)
+            transformed.v0 = glm::vec3(obj.transform * glm::vec4(tri.v0, 1.0f));
+            transformed.v1 = glm::vec3(obj.transform * glm::vec4(tri.v1, 1.0f));
+            transformed.v2 = glm::vec3(obj.transform * glm::vec4(tri.v2, 1.0f));
             transformed.materialIndex = tri.materialIndex;
             allTriangles.push_back(transformed);
         }
@@ -543,23 +548,24 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     }
 
     if (!loadedSSBOCache) {
-        std::vector<BVH> meshBLAS(scene.meshes.size());
+        std::vector<BVH> meshBLAS(scene.gameObjects.size());
         std::vector<BVHNode> meshRootNodes;
         int nodeOffset = 0, triOffset = 0;
         bool loadedAllBLAS = true;
         meshInstances.clear();
         allTriangles.clear();
         // Try to load BLAS for each mesh
-        for (size_t i = 0; i < scene.meshes.size(); ++i) {
-            const auto& mesh = scene.meshes[i];
+        for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
+            const auto& obj = scene.gameObjects[i];
+            const auto& mesh = obj.mesh;
             std::string meshName = "mesh" + std::to_string(i);
             std::string blasBase = cacheDir + meshName;
             std::vector<Triangle> transformedTris;
-            for (const auto& tri : mesh.triangles) {
+            for (const auto& tri : mesh->triangles) {
                 Triangle transformed;
-                transformed.v0 = glm::vec3(mesh.transform * glm::vec4(tri.v0, 1.0f));
-                transformed.v1 = glm::vec3(mesh.transform * glm::vec4(tri.v1, 1.0f));
-                transformed.v2 = glm::vec3(mesh.transform * glm::vec4(tri.v2, 1.0f));
+                transformed.v0 = glm::vec3(obj.transform * glm::vec4(tri.v0, 1.0f));
+                transformed.v1 = glm::vec3(obj.transform * glm::vec4(tri.v1, 1.0f));
+                transformed.v2 = glm::vec3(obj.transform * glm::vec4(tri.v2, 1.0f));
                 transformed.materialIndex = tri.materialIndex;
                 transformedTris.push_back(transformed);
             }
@@ -581,9 +587,8 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             BVHInstance inst;
             inst.blasNodeOffset = nodeOffset;
             inst.blasTriOffset = triOffset;
-            inst.meshIndex = (int)i;
             inst.globalTriOffset = allTriangles.size() - transformedTris.size();
-            inst.transform = mesh.transform;
+            inst.transform = obj.transform;
             meshInstances.push_back(inst);
             nodeOffset += meshBLAS[i].nodes.size();
             triOffset += meshBLAS[i].triIndices.size();
@@ -685,14 +690,89 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     });
 }
 
-void updateSSBOs(const Scene& scene) {
-    // Combine triangles from all meshes
-    std::vector<Triangle> allTriangles = combineTriangles(scene);
-
-    // Update the triangle SSBO with the transformed vertex data
+// Dynamic BVH/SSBO update for game objects
+void updateDynamicBVHAndSSBOs(Scene& scene) {
+    // 1. Build BLAS for each unique mesh only once (unless geometry changes)
+    static std::vector<BVH> meshBLAS;
+    static std::vector<BVHNode> meshRootNodes;
+    static bool first = true;
+    if (first || meshBLAS.size() != scene.gameObjects.size()) {
+        meshBLAS.resize(scene.gameObjects.size());
+        meshRootNodes.resize(scene.gameObjects.size());
+        for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
+            meshBLAS[i].buildBLAS(scene.gameObjects[i].mesh->triangles);
+            meshRootNodes[i] = meshBLAS[i].nodes[0];
+        }
+        first = false;
+    }
+    // 2. Build BVHInstances for all objects (with current transform)
+    std::vector<BVHInstance> meshInstances;
+    for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
+        BVHInstance inst;
+        // Compute node/tri/globalTri offsets for this mesh in the concatenated BLAS buffers
+        inst.blasNodeOffset = 0;
+        inst.blasTriOffset = 0;
+        inst.globalTriOffset = 0;
+        for (int j = 0; j < i; ++j) {
+            inst.blasNodeOffset += meshBLAS[j].nodes.size();
+            inst.blasTriOffset += meshBLAS[j].triIndices.size();
+            inst.globalTriOffset += scene.gameObjects[j].mesh->triangles.size();
+        }
+        inst.transform = scene.gameObjects[i].transform;
+        meshInstances.push_back(inst);
+    }
+    // 3. Flatten all BLAS nodes/indices for GPU
+    std::vector<BVHNode> allBLASNodes;
+    std::vector<int> allBLASTriIndices;
+    for (size_t i = 0; i < meshBLAS.size(); ++i) {
+        allBLASNodes.insert(allBLASNodes.end(), meshBLAS[i].nodes.begin(), meshBLAS[i].nodes.end());
+        allBLASTriIndices.insert(allBLASTriIndices.end(), meshBLAS[i].triIndices.begin(), meshBLAS[i].triIndices.end());
+    }
+    // 4. Combine all triangles (object space, not transformed)
+    std::vector<Triangle> allTriangles;
+    for (const auto& obj : scene.gameObjects) {
+        allTriangles.insert(allTriangles.end(), obj.mesh->triangles.begin(), obj.mesh->triangles.end());
+    }
+    // 5. Rebuild TLAS every frame (since transforms may change)
+    std::vector<BVHNode> instanceRootNodes;
+    for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
+        // Transform mesh AABB by instance transform
+        const BVHNode& meshRoot = meshRootNodes[i];
+        glm::vec3 corners[8];
+        corners[0] = meshRoot.boundsMin;
+        corners[1] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMin.y, meshRoot.boundsMax.z);
+        corners[2] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMax.y, meshRoot.boundsMin.z);
+        corners[3] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMax.y, meshRoot.boundsMax.z);
+        corners[4] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMin.y, meshRoot.boundsMin.z);
+        corners[5] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMin.y, meshRoot.boundsMax.z);
+        corners[6] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMax.y, meshRoot.boundsMin.z);
+        corners[7] = meshRoot.boundsMax;
+        glm::vec3 bmin(1e30f), bmax(-1e30f);
+        for (int c = 0; c < 8; ++c) {
+            glm::vec3 tc = glm::vec3(scene.gameObjects[i].transform * glm::vec4(corners[c], 1.0f));
+            bmin = glm::min(bmin, tc);
+            bmax = glm::max(bmax, tc);
+        }
+        BVHNode instRoot = meshRoot;
+        instRoot.boundsMin = bmin;
+        instRoot.boundsMax = bmax;
+        instanceRootNodes.push_back(instRoot);
+    }
+    static BVH tlas;
+    tlas.buildTLAS(meshInstances, instanceRootNodes);
+    // 6. Update SSBOs
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allTriangles.size() * sizeof(Triangle), allTriangles.data());
-    // TODO: If meshes move, rebuild and update the BVH and its SSBOs here for dynamic scenes.
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, meshInstances.size() * sizeof(BVHInstance), meshInstances.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, tlas.nodes.size() * sizeof(BVHNode), tlas.nodes.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, tlas.triIndices.size() * sizeof(int), tlas.triIndices.data());
 }
 
 void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
@@ -707,8 +787,8 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
 
     // Send the number of triangles
     int totalTriangles = 0;
-    for (const auto& mesh : scene.meshes) {
-        totalTriangles += mesh.triangles.size();
+    for (const auto& obj : scene.gameObjects) {
+        totalTriangles += obj.mesh->triangles.size();
     }
     glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), totalTriangles);
 

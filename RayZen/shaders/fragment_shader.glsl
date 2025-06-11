@@ -348,15 +348,18 @@ void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor,
         }
         int path[32]; int pathLen = 0;
         findBVHBranchIterative(nodeOffset, triOffset, nodeCount, selectedTri, path, pathLen);
+        // Fetch the instance transform for this BLAS
+        mat4 instanceTransform = bvhInstances[selectedBLAS].transform;
+        mat4 viewProj = camera.projectionMatrix * camera.viewMatrix;
         for (int i = 0; i < pathLen; ++i) {
             BVHNode node = blasNodes[nodeOffset + path[i]];
-            float w = aabbWireframe(node.boundsMin, node.boundsMax, camera.projectionMatrix * camera.viewMatrix, fragCoord, 2.0);
-            if (w > 0.0) {
-                float t = float(i) / float(pathLen);
-                vec3 grad = hsv2rgb(vec3(0.6 - t * 0.5, 1.0, 1.0));
-                blasColor = mix(blasColor, grad, w);
-                blasWire = max(blasWire, w);
-            }
+            // Transform AABB corners to world space using instanceTransform
+            vec3 bmin = (instanceTransform * vec4(node.boundsMin, 1.0)).xyz;
+            vec3 bmax = (instanceTransform * vec4(node.boundsMax, 1.0)).xyz;
+            float wire = aabbWireframe(bmin, bmax, viewProj, fragCoord, 2.0);
+            blasWire = max(blasWire, wire);
+            float hue = float(i) / float(pathLen);
+            blasColor = mix(blasColor, hsv2rgb(vec3(hue, 1.0, 1.0)), wire);
         }
     }
 }
@@ -461,15 +464,22 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
             for (int i = 0; i < node.count; ++i) {
                 int instIdx = tlasTriIndices[node.leftFirst + i];
                 BVHInstance inst = bvhInstances[instIdx];
-                // Optionally: transform ray to mesh local space if inst.transform is not identity
-                float t;
-                vec3 tempHit, tempNormal;
+                // Transform ray to mesh local space using inverse(instance.transform)
+                mat4 invTransform = inverse(inst.transform);
+                vec3 localOrigin = vec3(invTransform * vec4(ray.origin, 1.0));
+                vec3 localDir = normalize(vec3(invTransform * vec4(ray.direction, 0.0)));
+                Ray localRay = Ray(localOrigin, localDir);
+                float tLocal;
+                vec3 localHit, localNormal;
                 int tempMat;
-                if (traverseBLAS(ray, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, t, tempHit, tempNormal, tempMat, anyHit)) {
-                    if (t < tHit) {
-                        tHit = t;
-                        hitPoint = tempHit;
-                        normal = tempNormal;
+                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat, anyHit)) {
+                    // Transform hit point and normal back to world space
+                    vec3 worldHit = vec3(inst.transform * vec4(localHit, 1.0));
+                    float tWorld = length(worldHit - ray.origin); // world-space t
+                    if (tWorld < tHit) {
+                        tHit = tWorld;
+                        hitPoint = worldHit;
+                        normal = normalize(mat3(transpose(inverse(inst.transform))) * localNormal);
                         materialIndex = tempMat;
                         instanceIdx = instIdx;
                         hit = true;
