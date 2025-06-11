@@ -11,6 +11,9 @@
 # Keep monkey.obj
 !RayZen/meshes/monkey.obj
 
+*.bin
+**/second_frame.png
+
 # Precompiled Headers
 *.gch
 *.pch

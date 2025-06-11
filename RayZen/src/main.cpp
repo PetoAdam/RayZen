@@ -1,3 +1,5 @@
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -93,12 +95,16 @@ int main(int argc, char** argv) {
     // Parse CLI log level and BVH rebuild flag
     LogLevel logLevel = LogLevel::INFO;
     bool forceRebuildBVH = false;
+    std::string screenshotFile = "";
+    int screenshotFrame = 2;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
         else if (arg == "--log=info") logLevel = LogLevel::INFO;
         else if (arg == "--log=error") logLevel = LogLevel::ERROR;
         else if (arg == "--rebuild-bvh") forceRebuildBVH = true;
+        else if (arg.rfind("--screenshot=", 0) == 0) screenshotFile = arg.substr(13);
+        else if (arg.rfind("--screenshot-frame=", 0) == 0) screenshotFrame = std::stoi(arg.substr(19));
     }
     Logger::setLevel(logLevel);
 
@@ -208,6 +214,7 @@ int main(int argc, char** argv) {
     bool firstFrame = true;
     double firstUseProgramMs = 0.0, firstDrawMs = 0.0;
     float animTime = 0.0f;
+    int frameCount = 0;
     while (!glfwWindowShouldClose(window)) {
 
         // Calculate delta time
@@ -373,6 +380,28 @@ int main(int argc, char** argv) {
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        frameCount++;
+        // Screenshot logic
+        if (!screenshotFile.empty() && frameCount == screenshotFrame) {
+            int width, height;
+            glfwGetFramebufferSize(window, &width, &height);
+            std::vector<unsigned char> pixels(width * height * 3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+            // Flip vertically
+            std::vector<unsigned char> flipped(width * height * 3);
+            for (int y = 0; y < height; ++y) {
+                memcpy(&flipped[y * width * 3], &pixels[(height - 1 - y) * width * 3], width * 3);
+            }
+            if (stbi_write_png(screenshotFile.c_str(), width, height, 3, flipped.data(), width * 3)) {
+                Logger::info("Saved screenshot to " + screenshotFile);
+            } else {
+                Logger::error("Failed to save screenshot to " + screenshotFile);
+            }
+            // Optionally exit after screenshot
+            break;
+        }
 
         // Print fps on a single line at the bottom of the terminal only in DEBUG mode
         if (Logger::getLevel() <= LogLevel::DEBUG) {
