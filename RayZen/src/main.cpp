@@ -168,15 +168,15 @@ int main(int argc, char** argv) {
 
     // Define materials
     scene.materials = {
-        // Red matte material (non-metallic, rough)
+        // 0: Red matte
         Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
-        // Green metallic material (metallic, smooth)
-        Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.2f, 0.5f, 0.0f, 1.5f),
-        // Mirror-like material (fully reflective, smooth)
-        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.1f, 1.0f, 0.0f, 1.5f),
-        // Glass-like material (transparent, smooth)
-        Material(glm::vec3(1.0f, 1.0f, 1.0f), 1.0f, 0.0f, 0.0f, 0.99f, 1.5f),
-        // Rough surface material (non-metallic, rough)
+        // 1: Green metallic (moderate roughness to avoid mirror-like look)
+        Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.35f, 0.3f, 0.0f, 1.5f),
+        // 2: Mirror
+        Material(glm::vec3(1.0f), 1.0f, 0.05f, 1.0f, 0.0f, 1.5f),
+        // 3: Glass (slight blue tint for visibility)
+        Material(glm::vec3(0.85f, 0.95f, 1.0f), 0.0f, 0.02f, 0.05f, 0.94f, 1.5f),
+        // 4: Rough surface
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
 
@@ -190,19 +190,29 @@ int main(int argc, char** argv) {
     auto monkeyMesh = std::make_shared<Mesh>();
     auto monkey2Mesh = std::make_shared<Mesh>();
     auto movingCubeMesh = std::make_shared<Mesh>();
+    auto movingCubeMesh2 = std::make_shared<Mesh>();
+    auto movingCubeMesh3 = std::make_shared<Mesh>();
+    auto glassMesh = std::make_shared<Mesh>();
     floorMesh->loadFromOBJ("../meshes/cube.obj", 0);
     monkeyMesh->loadFromOBJ("../meshes/monkey.obj", 1);
     monkey2Mesh->loadFromOBJ("../meshes/monkey.obj", 2);
-    movingCubeMesh->loadFromOBJ("../meshes/cube.obj", 1);
+    movingCubeMesh->loadFromOBJ("../meshes/car.obj", 0);
+    movingCubeMesh2->loadFromOBJ("../meshes/monkey.obj", 0);
+    movingCubeMesh3->loadFromOBJ("../meshes/monkey.obj", 0);
+    glassMesh->loadFromOBJ("../meshes/monkey.obj", 3); // transparent glass monkey
 
     // Add GameObjects to the scene
     scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-4.0f, 0.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 0.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))});
+    scene.gameObjects.push_back(GameObject{movingCubeMesh2, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.f))});
+    scene.gameObjects.push_back(GameObject{movingCubeMesh3, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 4.f))});
+    scene.gameObjects.push_back(GameObject{glassMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(1.2f)), glm::vec3(2.5f, 0.8f, 2.5f))});
 
     // Initialize SSBOs (initial build)
     initializeSSBOs(scene, forceRebuildBVH);
+    Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(scene.gameObjects.size()-1));
 
     // Main render loop
     bool firstFrame = true;
@@ -315,13 +325,13 @@ int main(int argc, char** argv) {
 
         // Animate the moving cube (last in gameObjects)
         animTime += deltaTime;
-        if (!scene.gameObjects.empty()) {
-            // Animate the last object (moving cube)
-            GameObject& movingCube = scene.gameObjects.back();
-            float x = -2.0f + 2.0f * sin(animTime);
-            float y = 0.5f + 0.5f * cos(animTime * 0.5f);
-            movingCube.transform = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f));
-        }
+        //if (!scene.gameObjects.empty()) {
+        //    // Animate the last object (moving cube)
+        //    GameObject& movingCube = scene.gameObjects.back();
+        //    float x = -2.0f + 2.0f * sin(animTime);
+        //    float y = 0.5f + 0.5f * cos(animTime * 0.5f);
+        //    movingCube.transform = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f));
+        //}
 
         // Update dynamic BVH/SSBOs for game objects
         updateDynamicBVHAndSSBOs(scene);
@@ -543,7 +553,15 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             loadVectorFromFile(ssboCachePrefix + "tlasnodes.bin", tlasNodes) &&
             loadVectorFromFile(ssboCachePrefix + "tlastris.bin", tlasTriIndices);
         if (loadedSSBOCache) {
-            Logger::info("Loaded SSBO data from cache");
+            // Invalidate if scene object count changed since cache write
+            if (meshInstances.size() != scene.gameObjects.size()) {
+                Logger::info("Cache invalidated: game object count changed (was " + std::to_string(meshInstances.size()) + ", now " + std::to_string(scene.gameObjects.size()) + ")");
+                loadedSSBOCache = false;
+                allTriangles.clear(); allBLASNodes.clear(); allBLASTriIndices.clear();
+                meshInstances.clear(); tlasNodes.clear(); tlasTriIndices.clear();
+            } else {
+                Logger::info("Loaded SSBO data from cache");
+            }
         }
     }
 
@@ -583,7 +601,27 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
                 Logger::info("Saved BLAS to cache for " + meshName);
             }
             allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
-            meshRootNodes.push_back(meshBLAS[i].nodes[0]);
+            // Compute per-instance root node (AABB transformed by instance transform)
+            const BVHNode& meshRoot = meshBLAS[i].nodes[0];
+            glm::vec3 corners[8];
+            corners[0] = meshRoot.boundsMin;
+            corners[1] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMin.y, meshRoot.boundsMax.z);
+            corners[2] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMax.y, meshRoot.boundsMin.z);
+            corners[3] = glm::vec3(meshRoot.boundsMin.x, meshRoot.boundsMax.y, meshRoot.boundsMax.z);
+            corners[4] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMin.y, meshRoot.boundsMin.z);
+            corners[5] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMin.y, meshRoot.boundsMax.z);
+            corners[6] = glm::vec3(meshRoot.boundsMax.x, meshRoot.boundsMax.y, meshRoot.boundsMin.z);
+            corners[7] = meshRoot.boundsMax;
+            glm::vec3 bmin(1e30f), bmax(-1e30f);
+            for (int c = 0; c < 8; ++c) {
+                glm::vec3 tc = glm::vec3(obj.transform * glm::vec4(corners[c], 1.0f));
+                bmin = glm::min(bmin, tc);
+                bmax = glm::max(bmax, tc);
+            }
+            BVHNode instRoot = meshRoot;
+            instRoot.boundsMin = bmin;
+            instRoot.boundsMax = bmax;
+            meshRootNodes.push_back(instRoot);
             BVHInstance inst;
             inst.blasNodeOffset = nodeOffset;
             inst.blasTriOffset = triOffset;
@@ -596,6 +634,8 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         }
         // Try to load TLAS and BVHInstances
         BVH tlas;
+        tlas.nodes.clear();
+        tlas.triIndices.clear();
         std::string tlasBase = cacheDir + "scene_tlas";
         bool loadedTLAS = false;
         if (!forceRebuildBVH && loadedAllBLAS && fs::exists(tlasBase + ".nodes.bin") && fs::exists(tlasBase + ".tris.bin") && fs::exists(cacheDir + "instances.bin")) {
@@ -606,7 +646,16 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         }
         if (!loadedTLAS) {
             Logger::info("Building TLAS from scratch");
+            Logger::info("[initializeSSBOs] meshInstances size: " + std::to_string(meshInstances.size()) + ", meshRootNodes size: " + std::to_string(meshRootNodes.size()));
+            tlas.nodes.clear();
+            tlas.triIndices.clear();
             tlas.buildTLAS(meshInstances, meshRootNodes);
+            // Log TLAS node info
+            Logger::info("TLAS node count: " + std::to_string(tlas.nodes.size()));
+            for (size_t i = 0; i < tlas.nodes.size(); ++i) {
+                const auto& n = tlas.nodes[i];
+                Logger::info("TLAS node " + std::to_string(i) + ": min(" + std::to_string(n.boundsMin.x) + "," + std::to_string(n.boundsMin.y) + "," + std::to_string(n.boundsMin.z) + ") max(" + std::to_string(n.boundsMax.x) + "," + std::to_string(n.boundsMax.y) + "," + std::to_string(n.boundsMax.z) + ") count=" + std::to_string(n.count) + ", leftFirst=" + std::to_string(n.leftFirst));
+            }
             saveBVHToFile(tlasBase, tlas);
             saveBVHInstancesToFile(cacheDir + "instances.bin", meshInstances);
             Logger::info("Saved TLAS and BVHInstances to cache");
@@ -628,6 +677,12 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         saveVectorToFile(ssboCachePrefix + "tlasnodes.bin", tlasNodes);
         saveVectorToFile(ssboCachePrefix + "tlastris.bin", tlasTriIndices);
         Logger::info("Saved SSBO data to cache");
+
+        for (size_t i = 0; i < tlasTriIndices.size(); ++i) {
+            if (tlasTriIndices[i] < 0 || tlasTriIndices[i] >= meshInstances.size()) {
+                Logger::error("Invalid TLAS tri index at " + std::to_string(i) + ": " + std::to_string(tlasTriIndices[i]));
+            }
+        }
     }
 
     Logger::info("Initializing SSBOs for triangles, materials, lights, BVHs, and instances");
@@ -759,6 +814,7 @@ void updateDynamicBVHAndSSBOs(Scene& scene) {
         instanceRootNodes.push_back(instRoot);
     }
     static BVH tlas;
+    //Logger::info("[updateDynamicBVHAndSSBOs] meshInstances size: " + std::to_string(meshInstances.size()) + ", instanceRootNodes size: " + std::to_string(instanceRootNodes.size()));
     tlas.buildTLAS(meshInstances, instanceRootNodes);
     // 6. Update SSBOs
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
@@ -791,6 +847,7 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
         totalTriangles += obj.mesh->triangles.size();
     }
     glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), totalTriangles);
+    glUniform1i(glGetUniformLocation(shaderProgram, "numLights"), (int)scene.lights.size());
 
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));

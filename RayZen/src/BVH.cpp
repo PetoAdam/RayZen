@@ -201,12 +201,19 @@ void BVH::buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::ve
         }
         nodes[nidx].boundsMin = bmin;
         nodes[nidx].boundsMax = bmax;
-        if (count <= 2) { // leaf: store mesh instance indices in triIndices
+        if (count == 1) { // leaf: single instance
             nodes[nidx].leftFirst = (int)triIndices.size();
-            nodes[nidx].count = count;
-            for (int i = start; i < end; ++i) triIndices.push_back(meshIndices[i]);
+            nodes[nidx].count = 1;
+            triIndices.push_back(meshIndices[start]);
             continue;
         }
+        //if (count == 2) { // leaf: two instances
+        //    nodes[nidx].leftFirst = (int)triIndices.size();
+        //    nodes[nidx].count = 2;
+        //    triIndices.push_back(meshIndices[start]);
+        //    triIndices.push_back(meshIndices[start+1]);
+        //    continue;
+        //}
         glm::vec3 extent = bmax - bmin;
         int axis = 0;
         if (extent.y > extent.x && extent.y > extent.z) axis = 1;
