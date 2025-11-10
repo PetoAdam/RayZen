@@ -1,13 +1,22 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <vector>
+#include <cstdint>
+#include <thread>
+#include <atomic>
+#include <unordered_map>
+#include <cstddef>
+#include <cmath>
+#include <algorithm>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <filesystem>
+#include <system_error>
 #include <chrono>
 #include <memory>
 
@@ -30,14 +39,20 @@ unsigned int SCR_HEIGHT = 600;
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene);
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 void initializeSSBOs(const Scene& scene, bool forceRebuildBVH = false);
 void updateDynamicBVHAndSSBOs(Scene& scene);
+void buildRasterMeshes(const Scene& scene);
+void renderRasterized(const Scene& scene);
+void cleanupRasterMeshes();
+void sendRasterSceneData(GLuint shaderProgram, const Scene& scene);
+void runPathTracerWarmup(GLFWwindow* window, Scene& scene, int warmupFrames);
 
 // Global variables
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
+GLuint rasterShaderProgram;
 GLuint triangleSSBO, materialSSBO, lightSSBO;
 GLuint tlasNodeSSBO, tlasTriIdxSSBO, blasNodeSSBO, blasTriIdxSSBO, bvhInstanceSSBO;
 float lastFrame = 0.0f;
@@ -47,6 +62,34 @@ bool debugShowBVH = false;
 int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
 int debugSelectedBLAS = 0;
 int debugSelectedTri = 0;
+bool editorMode = false;
+
+std::atomic<bool> gPathTracerReady{false};
+std::atomic<GLuint> gPathTracerProgramHandle{0};
+std::atomic<double> gPathTracerCompileMs{0.0};
+std::thread gPathTracerThread;
+GLFWwindow* gPathTracerCompileWindow = nullptr;
+
+struct RasterMeshGPU {
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    GLsizei vertexCount = 0;
+};
+
+struct RasterVertex {
+    glm::vec3 position;
+    glm::vec3 normal;
+    int materialIndex;
+};
+
+static std::unordered_map<const Mesh*, RasterMeshGPU> gRasterMeshCache;
+
+struct ShaderBinaryMetadata {
+    uint64_t vertexTimestamp = 0;
+    uint64_t fragmentTimestamp = 0;
+    uint32_t binaryFormat = 0;
+    uint32_t binaryLength = 0;
+};
 
 // Serialize a vector of POD types to a binary file
 template <typename T>
@@ -93,14 +136,57 @@ int main(int argc, char** argv) {
     // Parse CLI log level and BVH rebuild flag
     LogLevel logLevel = LogLevel::INFO;
     bool forceRebuildBVH = false;
+    bool requestPathTracerOnly = false;
+    int warmupFrames = 0;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
         else if (arg == "--log=info") logLevel = LogLevel::INFO;
         else if (arg == "--log=error") logLevel = LogLevel::ERROR;
         else if (arg == "--rebuild-bvh") forceRebuildBVH = true;
+        else if (arg == "--path-tracer-only") requestPathTracerOnly = true;
+        else if (arg.rfind("--warmup-frames=", 0) == 0) {
+            std::string value = arg.substr(std::string("--warmup-frames=").size());
+            try {
+                warmupFrames = std::max(0, std::stoi(value));
+            } catch (const std::exception&) {
+                std::cerr << "Invalid value for --warmup-frames: " << value << std::endl;
+                warmupFrames = 0;
+            }
+        }
+    }
+    if (warmupFrames > 0) {
+        requestPathTracerOnly = true;
     }
     Logger::setLevel(logLevel);
+
+    auto startupStart = std::chrono::high_resolution_clock::now();
+    auto startupCheckpoint = startupStart;
+    auto formatMs = [](double ms) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3) << ms;
+        return oss.str();
+    };
+    auto logStartupStep = [&](const std::string& label) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double sinceLast = std::chrono::duration<double, std::milli>(now - startupCheckpoint).count();
+        double total = std::chrono::duration<double, std::milli>(now - startupStart).count();
+        Logger::info("Startup step [" + label + "]: " + formatMs(sinceLast) + " ms (" + formatMs(total) + " ms total)");
+        startupCheckpoint = now;
+    };
+
+    auto loadMeshWithTiming = [&](const std::shared_ptr<Mesh>& mesh, const std::string& path, int materialIndex, const std::string& label) {
+        auto begin = std::chrono::high_resolution_clock::now();
+        bool ok = mesh->loadFromOBJ(path, materialIndex);
+        auto end = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double, std::milli>(end - begin).count();
+        if (!ok) {
+            Logger::error("Mesh load failed [" + label + "] from " + path);
+        } else {
+            Logger::info("Mesh load [" + label + "] " + std::to_string(mesh->triangles.size()) + " tris in " + formatMs(elapsed) + " ms");
+        }
+        return ok;
+    };
 
     // Print control scheme at startup
     Logger::info("==== RayZen Controls ====");
@@ -109,6 +195,7 @@ int main(int argc, char** argv) {
     Logger::info("L: Toggle light debug markers");
     Logger::info("B: Toggle BVH wireframe debug");
     Logger::info("N: Toggle BVH debug mode (TLAS/BLAS)");
+    Logger::info("F1: Toggle editor raster mode");
     Logger::info("ESC: Quit");
     Logger::info("========================");
 
@@ -118,17 +205,42 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    struct ContextRequest {
+        int major;
+        int minor;
+    };
+    const ContextRequest candidates[] = {
+        {4, 6},
+        {4, 5},
+        {4, 3},
+        {3, 3}
+    };
 
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "RayZen", nullptr, nullptr);
+    GLFWwindow* window = nullptr;
+    for (const auto& candidate : candidates) {
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, candidate.major);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, candidate.minor);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        if (candidate.major >= 4) {
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+        }
+        window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "RayZen", nullptr, nullptr);
+        if (window != nullptr) {
+            Logger::info("Created OpenGL context " + std::to_string(candidate.major) + "." + std::to_string(candidate.minor));
+            break;
+        }
+        Logger::info("Failed to create OpenGL context " + std::to_string(candidate.major) + "." + std::to_string(candidate.minor) + ", trying lower version");
+    }
+
     if (window == nullptr) {
-        Logger::error("Failed to create GLFW window");
+        Logger::error("Failed to create GLFW window with compatible OpenGL context");
         glfwTerminate();
         return -1;
     }
     glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // disable vsync until warm-up completes
+    logStartupStep("GLFW init + window");
 
     // Initialize GLEW
     glewExperimental = GL_TRUE;
@@ -136,21 +248,81 @@ int main(int argc, char** argv) {
         Logger::error("Failed to initialize GLEW");
         return -1;
     }
+    const GLubyte* glVersion = glGetString(GL_VERSION);
+    if (glVersion) {
+        Logger::info(std::string("GL version: ") + reinterpret_cast<const char*>(glVersion));
+    }
+    logStartupStep("GLEW init");
 
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glEnable(GL_DEPTH_TEST);
+    glClearColor(0.05f, 0.05f, 0.07f, 1.0f);
 
     //glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);  // Hide the cursor when it's in the window
 
     // Load shaders
-    auto shaderStart = std::chrono::high_resolution_clock::now();
-    shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
-    auto shaderEnd = std::chrono::high_resolution_clock::now();
-    Logger::info(std::string("Shader compile/link time: ") + std::to_string(std::chrono::duration<double, std::milli>(shaderEnd - shaderStart).count()) + " ms");
+    bool awaitingPathTracerReady = false;
+    auto rasterCompileStart = std::chrono::high_resolution_clock::now();
+    rasterShaderProgram = loadShaders("../shaders/editor_vertex.glsl", "../shaders/editor_fragment.glsl");
+    auto rasterCompileEnd = std::chrono::high_resolution_clock::now();
+    Logger::info(std::string("Raster shader compile/link time: ") + std::to_string(std::chrono::duration<double, std::milli>(rasterCompileEnd - rasterCompileStart).count()) + " ms");
+
+    int contextMajor = glfwGetWindowAttrib(window, GLFW_CONTEXT_VERSION_MAJOR);
+    int contextMinor = glfwGetWindowAttrib(window, GLFW_CONTEXT_VERSION_MINOR);
+    auto launchAsyncPathTracerCompile = [&](GLFWwindow* shareWindow) -> bool {
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, contextMajor);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, contextMinor);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        if (contextMajor >= 4) {
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+        }
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        GLFWwindow* hidden = glfwCreateWindow(16, 16, "RayZenPathTracerCompile", nullptr, shareWindow);
+        glfwDefaultWindowHints();
+        if (!hidden) {
+            return false;
+        }
+        gPathTracerCompileWindow = hidden;
+        gPathTracerThread = std::thread([hidden]() {
+            glfwMakeContextCurrent(hidden);
+            auto start = std::chrono::high_resolution_clock::now();
+            GLuint program = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+            auto end = std::chrono::high_resolution_clock::now();
+            glFinish();
+            gPathTracerProgramHandle.store(program, std::memory_order_release);
+            gPathTracerCompileMs.store(std::chrono::duration<double, std::milli>(end - start).count(), std::memory_order_release);
+            gPathTracerReady.store(true, std::memory_order_release);
+            glfwMakeContextCurrent(nullptr);
+        });
+        return true;
+    };
+    bool userLockedEditorMode = false;
+    bool forceImmediatePathTracer = requestPathTracerOnly || warmupFrames > 0;
+    if (!forceImmediatePathTracer) {
+        awaitingPathTracerReady = launchAsyncPathTracerCompile(window);
+    }
+    if (forceImmediatePathTracer || !awaitingPathTracerReady) {
+        if (!forceImmediatePathTracer && !awaitingPathTracerReady) {
+            Logger::info("Async path tracer compile unavailable; compiling on primary context");
+        }
+        auto pathTracerStart = std::chrono::high_resolution_clock::now();
+        shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+        auto pathTracerEnd = std::chrono::high_resolution_clock::now();
+        gPathTracerCompileMs.store(std::chrono::duration<double, std::milli>(pathTracerEnd - pathTracerStart).count(), std::memory_order_release);
+        gPathTracerReady.store(true, std::memory_order_release);
+        Logger::info(std::string("Path tracer shader compile/link time: ") + std::to_string(gPathTracerCompileMs.load()) + " ms");
+    } else {
+        shaderProgram = 0;
+        editorMode = true;
+        Logger::info("Path tracer shader compiling asynchronously; using editor raster mode until ready");
+    }
+    logStartupStep("Shader compilation");
 
     // Setup quad for rendering
     setupQuad(quadVAO, quadVBO);
+    logStartupStep("Fullscreen quad setup");
 
     // Define scene
     Scene scene;
@@ -193,13 +365,14 @@ int main(int argc, char** argv) {
     auto movingCubeMesh2 = std::make_shared<Mesh>();
     auto movingCubeMesh3 = std::make_shared<Mesh>();
     auto glassMesh = std::make_shared<Mesh>();
-    floorMesh->loadFromOBJ("../meshes/cube.obj", 0);
-    monkeyMesh->loadFromOBJ("../meshes/monkey.obj", 1);
-    monkey2Mesh->loadFromOBJ("../meshes/monkey.obj", 2);
-    movingCubeMesh->loadFromOBJ("../meshes/car.obj", 0);
-    movingCubeMesh2->loadFromOBJ("../meshes/monkey.obj", 0);
-    movingCubeMesh3->loadFromOBJ("../meshes/monkey.obj", 0);
-    glassMesh->loadFromOBJ("../meshes/monkey.obj", 3); // transparent glass monkey
+    loadMeshWithTiming(floorMesh, "../meshes/cube.obj", 0, "floor");
+    loadMeshWithTiming(monkeyMesh, "../meshes/monkey.obj", 1, "monkey A");
+    loadMeshWithTiming(monkey2Mesh, "../meshes/monkey.obj", 2, "monkey B");
+    loadMeshWithTiming(movingCubeMesh, "../meshes/car.obj", 0, "car");
+    loadMeshWithTiming(movingCubeMesh2, "../meshes/monkey.obj", 0, "monkey C");
+    loadMeshWithTiming(movingCubeMesh3, "../meshes/monkey.obj", 0, "monkey D");
+    loadMeshWithTiming(glassMesh, "../meshes/monkey.obj", 3, "glass monkey");
+    logStartupStep("Mesh loading");
 
     // Add GameObjects to the scene
     scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
@@ -209,16 +382,52 @@ int main(int argc, char** argv) {
     scene.gameObjects.push_back(GameObject{movingCubeMesh2, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.f))});
     scene.gameObjects.push_back(GameObject{movingCubeMesh3, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 4.f))});
     scene.gameObjects.push_back(GameObject{glassMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(1.2f)), glm::vec3(2.5f, 0.8f, 2.5f))});
+    logStartupStep("Scene graph build");
 
     // Initialize SSBOs (initial build)
     initializeSSBOs(scene, forceRebuildBVH);
+    logStartupStep("SSBO/BVH init");
+    buildRasterMeshes(scene);
+    logStartupStep("Raster mesh build");
     Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(scene.gameObjects.size()-1));
+    logStartupStep("Startup ready");
+
+    if (warmupFrames > 0 && shaderProgram != 0) {
+        runPathTracerWarmup(window, scene, warmupFrames);
+        lastFrame = glfwGetTime();
+    }
 
     // Main render loop
     bool firstFrame = true;
     double firstUseProgramMs = 0.0, firstDrawMs = 0.0;
     float animTime = 0.0f;
+    int frameCounter = 0;
+    const int frameLogLimit = 100;
+    const int vsyncRestoreFrame = 5;
+    bool vsyncRestored = false;
     while (!glfwWindowShouldClose(window)) {
+        auto frameStart = std::chrono::high_resolution_clock::now();
+
+        if (awaitingPathTracerReady && gPathTracerReady.load(std::memory_order_acquire)) {
+            GLuint program = gPathTracerProgramHandle.exchange(0, std::memory_order_acq_rel);
+            if (program != 0) {
+                shaderProgram = program;
+                awaitingPathTracerReady = false;
+                if (!userLockedEditorMode) {
+                    editorMode = false;
+                }
+                firstFrame = true;
+                frameCounter = 0;
+                vsyncRestored = false;
+                glfwSwapInterval(0);
+                double compileMs = gPathTracerCompileMs.load(std::memory_order_acquire);
+                Logger::info(std::string("Path tracer shader ready (compile/link time: ") + formatMs(compileMs) + " ms)" + (userLockedEditorMode ? std::string(" Press F1 to enable path tracer when ready.") : std::string("")));
+            } else {
+                Logger::error("Path tracer shader compilation failed; remaining in editor mode");
+                awaitingPathTracerReady = false;
+                userLockedEditorMode = true;
+            }
+        }
 
         // Calculate delta time
         float currentFrame = glfwGetTime();
@@ -226,6 +435,32 @@ int main(int argc, char** argv) {
         lastFrame = currentFrame;
         processInput(window, scene.camera, deltaTime);
         scene.camera.updateViewMatrix();
+        auto afterInput = std::chrono::high_resolution_clock::now();
+
+        static bool editorKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS) {
+            if (!editorKeyPressed) {
+                bool newEditorMode = !editorMode;
+                if (!newEditorMode && shaderProgram == 0) {
+                    Logger::info("Path tracer shader not ready yet; staying in editor mode");
+                    userLockedEditorMode = true;
+                } else {
+                    editorMode = newEditorMode;
+                    userLockedEditorMode = editorMode;
+                    Logger::info(std::string("Editor raster mode: ") + (editorMode ? "On" : "Off"));
+                    if (!editorMode) {
+                        // Reset path tracer first-frame diagnostics when returning from editor mode
+                        firstFrame = true;
+                        frameCounter = 0;
+                        vsyncRestored = false;
+                        glfwSwapInterval(0);
+                    }
+                }
+                editorKeyPressed = true;
+            }
+        } else {
+            editorKeyPressed = false;
+        }
 
         // Toggle debugShowLights with 'L' key
         static bool lKeyPressed = false;
@@ -335,9 +570,36 @@ int main(int argc, char** argv) {
 
         // Update dynamic BVH/SSBOs for game objects
         updateDynamicBVHAndSSBOs(scene);
+        auto afterBVH = std::chrono::high_resolution_clock::now();
+
+        if (editorMode || shaderProgram == 0) {
+            auto beforeRender = std::chrono::high_resolution_clock::now();
+            renderRasterized(scene);
+            auto afterRender = std::chrono::high_resolution_clock::now();
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            auto frameEnd = std::chrono::high_resolution_clock::now();
+            if (frameCounter < frameLogLimit) {
+                double totalMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
+                double inputMs = std::chrono::duration<double, std::milli>(afterInput - frameStart).count();
+                double bvhMs = std::chrono::duration<double, std::milli>(afterBVH - afterInput).count();
+                double renderMs = std::chrono::duration<double, std::milli>(afterRender - beforeRender).count();
+                double swapMs = std::chrono::duration<double, std::milli>(frameEnd - afterRender).count();
+                Logger::info("Frame " + std::to_string(frameCounter) + " [editor] timings: total=" + formatMs(totalMs) + " ms (input=" + formatMs(inputMs) + ", bvh=" + formatMs(bvhMs) + ", render=" + formatMs(renderMs) + ", swap=" + formatMs(swapMs) + ")");
+            }
+            if (!vsyncRestored && frameCounter >= vsyncRestoreFrame) {
+                glfwSwapInterval(1);
+                vsyncRestored = true;
+                Logger::info("Re-enabled vsync after warmup frames");
+            }
+            ++frameCounter;
+            continue;
+        }
 
         // Send scene data to the shader
-        sendSceneDataToShader(shaderProgram, scene);
+    int bounceBudget = (frameCounter == 0) ? 1 : 5;
+    sendSceneDataToShader(shaderProgram, scene, bounceBudget);
+        auto afterSend = std::chrono::high_resolution_clock::now();
 
         // Set debugShowLights uniform
         GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
@@ -383,6 +645,24 @@ int main(int argc, char** argv) {
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+        auto frameEnd = std::chrono::high_resolution_clock::now();
+
+        if (!vsyncRestored && frameCounter >= vsyncRestoreFrame) {
+            glfwSwapInterval(1);
+            vsyncRestored = true;
+            Logger::info("Re-enabled vsync after warmup frames");
+        }
+
+        if (frameCounter < frameLogLimit) {
+            double totalMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
+            double inputMs = std::chrono::duration<double, std::milli>(afterInput - frameStart).count();
+            double bvhMs = std::chrono::duration<double, std::milli>(afterBVH - afterInput).count();
+            double sendMs = std::chrono::duration<double, std::milli>(afterSend - afterBVH).count();
+            double renderMs = std::chrono::duration<double, std::milli>(drawEnd - afterSend).count();
+            double swapMs = std::chrono::duration<double, std::milli>(frameEnd - drawEnd).count();
+            Logger::info("Frame " + std::to_string(frameCounter) + " timings: total=" + formatMs(totalMs) + " ms (input=" + formatMs(inputMs) + ", bvh=" + formatMs(bvhMs) + ", send=" + formatMs(sendMs) + ", render=" + formatMs(renderMs) + ", swap=" + formatMs(swapMs) + ")");
+        }
+        ++frameCounter;
 
         // Print fps on a single line at the bottom of the terminal only in DEBUG mode
         if (Logger::getLevel() <= LogLevel::DEBUG) {
@@ -391,6 +671,14 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    if (gPathTracerThread.joinable()) {
+        gPathTracerThread.join();
+    }
+    if (gPathTracerCompileWindow) {
+        glfwDestroyWindow(gPathTracerCompileWindow);
+        gPathTracerCompileWindow = nullptr;
+    }
+    cleanupRasterMeshes();
     glDeleteVertexArrays(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
 
@@ -452,9 +740,66 @@ void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
 }
 
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
+    fs::path vertexAbs = fs::absolute(fs::path(vertexPath));
+    fs::path fragmentAbs = fs::absolute(fs::path(fragmentPath));
+
+    auto toTimestamp = [](const fs::path& path) -> uint64_t {
+        std::error_code ec;
+        auto ft = fs::last_write_time(path, ec);
+        if (ec) return 0;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()).count());
+    };
+
+    uint64_t vertexTimestamp = toTimestamp(vertexAbs);
+    uint64_t fragmentTimestamp = toTimestamp(fragmentAbs);
+
+    fs::path cacheDir = vertexAbs.parent_path() / "cache";
+    std::error_code cacheEc;
+    fs::create_directories(cacheDir, cacheEc);
+
+    std::string cacheKeyBase = vertexAbs.filename().string() + "_" + fragmentAbs.filename().string();
+    std::string cacheKey = cacheKeyBase + "_" + std::to_string(std::hash<std::string>{}(vertexAbs.string() + "|" + fragmentAbs.string()));
+    fs::path binaryPath = cacheDir / (cacheKey + ".bin");
+    fs::path metaPath = cacheDir / (cacheKey + ".meta");
+
+    static bool binarySupportChecked = false;
+    static GLint binaryFormatCount = 0;
+    if (!binarySupportChecked) {
+        glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &binaryFormatCount);
+        binarySupportChecked = true;
+        if (binaryFormatCount <= 0) {
+            Logger::info("GL program binary retrieval unavailable; shader caching disabled");
+        }
+    }
+    bool canUseBinary = binaryFormatCount > 0;
+
+    if (canUseBinary && fs::exists(binaryPath) && fs::exists(metaPath)) {
+        ShaderBinaryMetadata meta{};
+        std::ifstream metaFile(metaPath, std::ios::binary);
+        if (metaFile.read(reinterpret_cast<char*>(&meta), sizeof(meta)) &&
+            meta.vertexTimestamp == vertexTimestamp &&
+            meta.fragmentTimestamp == fragmentTimestamp &&
+            meta.binaryLength > 0) {
+            std::vector<char> binary(meta.binaryLength);
+            std::ifstream binFile(binaryPath, std::ios::binary);
+            if (binFile.read(binary.data(), binary.size())) {
+                GLuint program = glCreateProgram();
+                glProgramBinary(program, meta.binaryFormat, binary.data(), static_cast<GLsizei>(binary.size()));
+                GLint linked = GL_FALSE;
+                glGetProgramiv(program, GL_LINK_STATUS, &linked);
+                if (linked == GL_TRUE) {
+                    Logger::info("Loaded shader binary cache for " + cacheKeyBase);
+                    return program;
+                }
+                Logger::info("Shader binary cache invalid for " + cacheKeyBase + ", recompiling");
+                glDeleteProgram(program);
+            }
+        }
+    }
+
     // Read vertex and fragment shader files
-    std::ifstream vShaderFile(vertexPath);
-    std::ifstream fShaderFile(fragmentPath);
+    std::ifstream vShaderFile(vertexAbs);
+    std::ifstream fShaderFile(fragmentAbs);
     std::stringstream vShaderStream, fShaderStream;
 
     vShaderStream << vShaderFile.rdbuf();
@@ -490,6 +835,9 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
 
     // Link shaders
     GLuint shaderProgram = glCreateProgram();
+    if (canUseBinary) {
+        glProgramParameteri(shaderProgram, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+    }
     glAttachShader(shaderProgram, vertex);
     glAttachShader(shaderProgram, fragment);
     glLinkProgram(shaderProgram);
@@ -501,6 +849,31 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
 
     glDeleteShader(vertex);
     glDeleteShader(fragment);
+
+    if (canUseBinary) {
+        GLint binaryLength = 0;
+        glGetProgramiv(shaderProgram, GL_PROGRAM_BINARY_LENGTH, &binaryLength);
+        if (binaryLength > 0) {
+            std::vector<char> binary(binaryLength);
+            GLenum binaryFormat = 0;
+            GLsizei lengthWritten = 0;
+            glGetProgramBinary(shaderProgram, binaryLength, &lengthWritten, &binaryFormat, binary.data());
+            if (lengthWritten > 0) {
+                binary.resize(lengthWritten);
+                ShaderBinaryMetadata meta{};
+                meta.vertexTimestamp = vertexTimestamp;
+                meta.fragmentTimestamp = fragmentTimestamp;
+                meta.binaryFormat = binaryFormat;
+                meta.binaryLength = static_cast<uint32_t>(binary.size());
+                std::ofstream binOut(binaryPath, std::ios::binary);
+                std::ofstream metaOut(metaPath, std::ios::binary);
+                if (binOut.write(binary.data(), binary.size()) &&
+                    metaOut.write(reinterpret_cast<const char*>(&meta), sizeof(meta))) {
+                    Logger::info("Wrote shader binary cache for " + cacheKeyBase);
+                }
+            }
+        }
+    }
 
     return shaderProgram;
 }
@@ -523,9 +896,9 @@ std::vector<Triangle> combineTriangles(const Scene& scene) {
 
 void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     // Cache directory
-    std::string cacheDir = "bvh_cache/";
+    std::string cacheDir = "bvh_cache/v2/";
     if (!fs::exists(cacheDir)) {
-        fs::create_directory(cacheDir);
+        fs::create_directories(cacheDir);
         Logger::info("Created BVH cache directory: " + cacheDir);
     }
 
@@ -537,7 +910,7 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     std::vector<BVHNode> tlasNodes;
     std::vector<int> tlasTriIndices;
     bool loadedSSBOCache = false;
-    std::string ssboCachePrefix = cacheDir + "ssbo_";
+    std::string ssboCachePrefix = cacheDir + "ssbo_v2_";
     if (!forceRebuildBVH &&
         fs::exists(ssboCachePrefix + "triangles.bin") &&
         fs::exists(ssboCachePrefix + "blasnodes.bin") &&
@@ -567,26 +940,20 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
 
     if (!loadedSSBOCache) {
         std::vector<BVH> meshBLAS(scene.gameObjects.size());
-        std::vector<BVHNode> meshRootNodes;
-        int nodeOffset = 0, triOffset = 0;
+        std::vector<BVHNode> worldRootNodes;
+        worldRootNodes.reserve(scene.gameObjects.size());
+        int nodeOffset = 0;
+        int triOffset = 0;
         bool loadedAllBLAS = true;
         meshInstances.clear();
         allTriangles.clear();
-        // Try to load BLAS for each mesh
+
         for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
             const auto& obj = scene.gameObjects[i];
             const auto& mesh = obj.mesh;
+            const auto& meshTris = mesh->triangles;
             std::string meshName = "mesh" + std::to_string(i);
             std::string blasBase = cacheDir + meshName;
-            std::vector<Triangle> transformedTris;
-            for (const auto& tri : mesh->triangles) {
-                Triangle transformed;
-                transformed.v0 = glm::vec3(obj.transform * glm::vec4(tri.v0, 1.0f));
-                transformed.v1 = glm::vec3(obj.transform * glm::vec4(tri.v1, 1.0f));
-                transformed.v2 = glm::vec3(obj.transform * glm::vec4(tri.v2, 1.0f));
-                transformed.materialIndex = tri.materialIndex;
-                transformedTris.push_back(transformed);
-            }
             bool loaded = false;
             if (!forceRebuildBVH && fs::exists(blasBase + ".nodes.bin") && fs::exists(blasBase + ".tris.bin")) {
                 loaded = loadBVHFromFile(blasBase, meshBLAS[i]);
@@ -596,12 +963,14 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             }
             if (!loaded) {
                 Logger::info("Building BLAS from scratch for " + meshName);
-                meshBLAS[i].buildBLAS(transformedTris);
+                meshBLAS[i].buildBLAS(meshTris);
                 saveBVHToFile(blasBase, meshBLAS[i]);
                 Logger::info("Saved BLAS to cache for " + meshName);
             }
-            allTriangles.insert(allTriangles.end(), transformedTris.begin(), transformedTris.end());
-            // Compute per-instance root node (AABB transformed by instance transform)
+
+            size_t triBase = allTriangles.size();
+            allTriangles.insert(allTriangles.end(), meshTris.begin(), meshTris.end());
+
             const BVHNode& meshRoot = meshBLAS[i].nodes[0];
             glm::vec3 corners[8];
             corners[0] = meshRoot.boundsMin;
@@ -621,18 +990,22 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             BVHNode instRoot = meshRoot;
             instRoot.boundsMin = bmin;
             instRoot.boundsMax = bmax;
-            meshRootNodes.push_back(instRoot);
-            BVHInstance inst;
+            worldRootNodes.push_back(instRoot);
+
+            BVHInstance inst{};
             inst.blasNodeOffset = nodeOffset;
             inst.blasTriOffset = triOffset;
-            inst.globalTriOffset = allTriangles.size() - transformedTris.size();
+            inst.globalTriOffset = static_cast<int>(triBase);
+            inst.meshIndex = static_cast<int>(i);
             inst.transform = obj.transform;
+            inst.inverseTransform = glm::inverse(obj.transform);
             meshInstances.push_back(inst);
-            nodeOffset += meshBLAS[i].nodes.size();
-            triOffset += meshBLAS[i].triIndices.size();
+
+            nodeOffset += static_cast<int>(meshBLAS[i].nodes.size());
+            triOffset += static_cast<int>(meshBLAS[i].triIndices.size());
             loadedAllBLAS &= loaded;
         }
-        // Try to load TLAS and BVHInstances
+
         BVH tlas;
         tlas.nodes.clear();
         tlas.triIndices.clear();
@@ -646,21 +1019,14 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         }
         if (!loadedTLAS) {
             Logger::info("Building TLAS from scratch");
-            Logger::info("[initializeSSBOs] meshInstances size: " + std::to_string(meshInstances.size()) + ", meshRootNodes size: " + std::to_string(meshRootNodes.size()));
             tlas.nodes.clear();
             tlas.triIndices.clear();
-            tlas.buildTLAS(meshInstances, meshRootNodes);
-            // Log TLAS node info
-            Logger::info("TLAS node count: " + std::to_string(tlas.nodes.size()));
-            for (size_t i = 0; i < tlas.nodes.size(); ++i) {
-                const auto& n = tlas.nodes[i];
-                Logger::info("TLAS node " + std::to_string(i) + ": min(" + std::to_string(n.boundsMin.x) + "," + std::to_string(n.boundsMin.y) + "," + std::to_string(n.boundsMin.z) + ") max(" + std::to_string(n.boundsMax.x) + "," + std::to_string(n.boundsMax.y) + "," + std::to_string(n.boundsMax.z) + ") count=" + std::to_string(n.count) + ", leftFirst=" + std::to_string(n.leftFirst));
-            }
+            tlas.buildTLAS(meshInstances, worldRootNodes);
             saveBVHToFile(tlasBase, tlas);
             saveBVHInstancesToFile(cacheDir + "instances.bin", meshInstances);
             Logger::info("Saved TLAS and BVHInstances to cache");
         }
-        // Flatten all BLAS nodes/indices for GPU
+
         allBLASNodes.clear();
         allBLASTriIndices.clear();
         for (const auto& blas : meshBLAS) {
@@ -669,7 +1035,7 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         }
         tlasNodes = tlas.nodes;
         tlasTriIndices = tlas.triIndices;
-        // Save SSBO-ready data to cache
+
         saveVectorToFile(ssboCachePrefix + "triangles.bin", allTriangles);
         saveVectorToFile(ssboCachePrefix + "blasnodes.bin", allBLASNodes);
         saveVectorToFile(ssboCachePrefix + "blastris.bin", allBLASTriIndices);
@@ -679,9 +1045,17 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         Logger::info("Saved SSBO data to cache");
 
         for (size_t i = 0; i < tlasTriIndices.size(); ++i) {
-            if (tlasTriIndices[i] < 0 || tlasTriIndices[i] >= meshInstances.size()) {
+            if (tlasTriIndices[i] < 0 || tlasTriIndices[i] >= static_cast<int>(meshInstances.size())) {
                 Logger::error("Invalid TLAS tri index at " + std::to_string(i) + ": " + std::to_string(tlasTriIndices[i]));
             }
+        }
+    }
+
+    if (loadedSSBOCache) {
+        for (size_t i = 0; i < meshInstances.size() && i < scene.gameObjects.size(); ++i) {
+            meshInstances[i].transform = scene.gameObjects[i].transform;
+            meshInstances[i].meshIndex = static_cast<int>(i);
+            meshInstances[i].inverseTransform = glm::inverse(scene.gameObjects[i].transform);
         }
     }
 
@@ -716,31 +1090,31 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     logBufferUpload("TLAS Nodes", tlasNodes.size() * sizeof(BVHNode), [&]() {
         glGenBuffers(1, &tlasNodeSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasNodes.size() * sizeof(BVHNode), tlasNodes.data(), GL_STATIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasNodes.size() * sizeof(BVHNode), tlasNodes.data(), GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
     });
     logBufferUpload("TLAS Tri Indices", tlasTriIndices.size() * sizeof(int), [&]() {
         glGenBuffers(1, &tlasTriIdxSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasTriIndices.size() * sizeof(int), tlasTriIndices.data(), GL_STATIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, tlasTriIndices.size() * sizeof(int), tlasTriIndices.data(), GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
     });
     logBufferUpload("BLAS Nodes", allBLASNodes.size() * sizeof(BVHNode), [&]() {
         glGenBuffers(1, &blasNodeSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data(), GL_STATIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data(), GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
     });
     logBufferUpload("BLAS Tri Indices", allBLASTriIndices.size() * sizeof(int), [&]() {
         glGenBuffers(1, &blasTriIdxSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data(), GL_STATIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data(), GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
     });
     logBufferUpload("BVH Instances", meshInstances.size() * sizeof(BVHInstance), [&]() {
         glGenBuffers(1, &bvhInstanceSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, meshInstances.size() * sizeof(BVHInstance), meshInstances.data(), GL_STATIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, meshInstances.size() * sizeof(BVHInstance), meshInstances.data(), GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
     });
 }
@@ -769,11 +1143,13 @@ void updateDynamicBVHAndSSBOs(Scene& scene) {
         inst.blasTriOffset = 0;
         inst.globalTriOffset = 0;
         for (int j = 0; j < i; ++j) {
-            inst.blasNodeOffset += meshBLAS[j].nodes.size();
-            inst.blasTriOffset += meshBLAS[j].triIndices.size();
-            inst.globalTriOffset += scene.gameObjects[j].mesh->triangles.size();
+            inst.blasNodeOffset += static_cast<int>(meshBLAS[j].nodes.size());
+            inst.blasTriOffset += static_cast<int>(meshBLAS[j].triIndices.size());
+            inst.globalTriOffset += static_cast<int>(scene.gameObjects[j].mesh->triangles.size());
         }
         inst.transform = scene.gameObjects[i].transform;
+    inst.inverseTransform = glm::inverse(scene.gameObjects[i].transform);
+        inst.meshIndex = static_cast<int>(i);
         meshInstances.push_back(inst);
     }
     // 3. Flatten all BLAS nodes/indices for GPU
@@ -831,7 +1207,153 @@ void updateDynamicBVHAndSSBOs(Scene& scene) {
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, tlas.triIndices.size() * sizeof(int), tlas.triIndices.data());
 }
 
-void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
+void buildRasterMeshes(const Scene& scene) {
+    for (const auto& obj : scene.gameObjects) {
+        const Mesh* meshPtr = obj.mesh.get();
+        if (!meshPtr) continue;
+        if (gRasterMeshCache.find(meshPtr) != gRasterMeshCache.end()) continue;
+        if (meshPtr->triangles.empty()) continue;
+
+        std::vector<RasterVertex> vertices;
+        vertices.reserve(meshPtr->triangles.size() * 3);
+
+        for (const auto& tri : meshPtr->triangles) {
+            glm::vec3 p0 = tri.v0;
+            glm::vec3 p1 = tri.v1;
+            glm::vec3 p2 = tri.v2;
+            glm::vec3 normal = glm::normalize(glm::cross(p1 - p0, p2 - p0));
+            if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z) || glm::length(normal) < 1e-5f) {
+                normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            }
+
+            RasterVertex v0{p0, normal, tri.materialIndex};
+            RasterVertex v1{p1, normal, tri.materialIndex};
+            RasterVertex v2{p2, normal, tri.materialIndex};
+            vertices.push_back(v0);
+            vertices.push_back(v1);
+            vertices.push_back(v2);
+        }
+
+        if (vertices.empty()) continue;
+
+        RasterMeshGPU gpu;
+        glGenVertexArrays(1, &gpu.vao);
+        glGenBuffers(1, &gpu.vbo);
+        glBindVertexArray(gpu.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(RasterVertex), vertices.data(), GL_STATIC_DRAW);
+
+        GLsizei stride = sizeof(RasterVertex);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(offsetof(RasterVertex, position)));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(offsetof(RasterVertex, normal)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribIPointer(2, 1, GL_INT, stride, reinterpret_cast<void*>(offsetof(RasterVertex, materialIndex)));
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        gpu.vertexCount = static_cast<GLsizei>(vertices.size());
+        gRasterMeshCache[meshPtr] = gpu;
+    }
+}
+
+void sendRasterSceneData(GLuint shaderProgram, const Scene& scene) {
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "uView"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "uProj"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
+    glUniform3fv(glGetUniformLocation(shaderProgram, "uCameraPos"), 1, glm::value_ptr(scene.camera.position));
+    glUniform1i(glGetUniformLocation(shaderProgram, "numLights"), static_cast<int>(scene.lights.size()));
+    GLint ambientLoc = glGetUniformLocation(shaderProgram, "uAmbientColor");
+    if (ambientLoc >= 0) {
+        glUniform3f(ambientLoc, 0.03f, 0.03f, 0.03f);
+    }
+}
+
+void renderRasterized(const Scene& scene) {
+    glEnable(GL_DEPTH_TEST);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(rasterShaderProgram);
+    sendRasterSceneData(rasterShaderProgram, scene);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+
+    GLint modelLoc = glGetUniformLocation(rasterShaderProgram, "uModel");
+    GLint normalLoc = glGetUniformLocation(rasterShaderProgram, "uNormalMatrix");
+
+    for (const auto& obj : scene.gameObjects) {
+        const Mesh* meshPtr = obj.mesh.get();
+        auto it = gRasterMeshCache.find(meshPtr);
+        if (it == gRasterMeshCache.end()) continue;
+
+        const RasterMeshGPU& gpu = it->second;
+        if (gpu.vertexCount == 0) continue;
+
+        glm::mat4 model = obj.transform;
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(model)));
+
+        if (modelLoc >= 0) {
+            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+        }
+        if (normalLoc >= 0) {
+            glUniformMatrix3fv(normalLoc, 1, GL_FALSE, glm::value_ptr(normalMatrix));
+        }
+
+        glBindVertexArray(gpu.vao);
+        glDrawArrays(GL_TRIANGLES, 0, gpu.vertexCount);
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+void cleanupRasterMeshes() {
+    for (auto& kv : gRasterMeshCache) {
+        if (kv.second.vbo != 0) {
+            glDeleteBuffers(1, &kv.second.vbo);
+        }
+        if (kv.second.vao != 0) {
+            glDeleteVertexArrays(1, &kv.second.vao);
+        }
+    }
+    gRasterMeshCache.clear();
+}
+
+void runPathTracerWarmup(GLFWwindow* window, Scene& scene, int warmupFrames) {
+    if (warmupFrames <= 0 || shaderProgram == 0) {
+        return;
+    }
+    Logger::info("Running path tracer warm-up for " + std::to_string(warmupFrames) + " frame(s) before enabling interactive rendering");
+    glfwHideWindow(window);
+    glfwSwapInterval(0);
+    for (int i = 0; i < warmupFrames; ++i) {
+        int bounceBudget = (i == 0) ? 1 : 5;
+        sendSceneDataToShader(shaderProgram, scene, bounceBudget);
+        GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
+        glUniform1i(debugLoc, debugShowLights ? 1 : 0);
+        GLint bvhLoc = glGetUniformLocation(shaderProgram, "debugShowBVH");
+        glUniform1i(bvhLoc, debugShowBVH ? 1 : 0);
+        GLint modeLoc = glGetUniformLocation(shaderProgram, "debugBVHMode");
+        glUniform1i(modeLoc, debugBVHMode);
+        GLint selBLASLoc = glGetUniformLocation(shaderProgram, "debugSelectedBLAS");
+        glUniform1i(selBLASLoc, debugSelectedBLAS);
+        GLint selTriLoc = glGetUniformLocation(shaderProgram, "debugSelectedTri");
+        glUniform1i(selTriLoc, debugSelectedTri);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glBindVertexArray(quadVAO);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glFinish();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+    glBindVertexArray(0);
+    glfwShowWindow(window);
+    Logger::info("Warm-up complete; first on-screen frame should reuse the cached pipeline");
+}
+
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget) {
     glUseProgram(shaderProgram);
     
     // Send resolution uniform
@@ -848,6 +1370,7 @@ void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene) {
     }
     glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), totalTriangles);
     glUniform1i(glGetUniformLocation(shaderProgram, "numLights"), (int)scene.lights.size());
+    glUniform1i(glGetUniformLocation(shaderProgram, "uniformBounceBudget"), bounceBudget);
 
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));

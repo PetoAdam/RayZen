@@ -17,6 +17,7 @@ struct BVHInstance {
     int meshIndex;     // Index of the mesh in the scene
     int globalTriOffset; // Offset into global triangle buffer (NEW)
     glm::mat4 transform; // (optional) for instancing, identity if unused
+    glm::mat4 inverseTransform; // precomputed inverse for faster traversal
 };
 
 enum class BVHSplitMethod {

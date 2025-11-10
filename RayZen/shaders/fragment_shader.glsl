@@ -89,6 +89,7 @@ struct BVHInstance {
     int meshIndex;
     int globalTriOffset; // Offset into global triangle buffer (NEW)
     mat4 transform; // (optional, not used if identity)
+    mat4 inverseTransform;
 };
 layout(std430, binding = 9) buffer BVHInstanceBuffer {
     BVHInstance bvhInstances[];
@@ -101,6 +102,7 @@ uniform bool debugShowBVH;
 uniform int debugBVHMode; // 0 = TLAS, 1 = BLAS
 uniform int debugSelectedBLAS; // mesh index
 uniform int debugSelectedTri; // triangle index within mesh
+uniform int uniformBounceBudget; // <=0 uses default bounce count
 
 out vec4 FragColor;
 
@@ -414,7 +416,7 @@ bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out v
 }
 
 // Traverse BLAS for a mesh instance
-bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, bool anyHit) {    
+bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {    
     tHit = 1e30;
     bool hit = false;
     int stack[64];
@@ -440,7 +442,6 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
                         normal = tempNormal;
                         materialIndex = tempMat;
                         hit = true;
-                        if (anyHit) return true; // Early exit
                     }
                 }
             }
@@ -453,7 +454,7 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
 }
 
 // Traverse TLAS, return closest hit and mesh instance index
-bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx, bool anyHit) {
+bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx) {
     tHit = 1e30;
     bool hit = false;
     int stack[64];
@@ -471,25 +472,25 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                 int instIdx = tlasTriIndices[node.leftFirst + i];
                 BVHInstance inst = bvhInstances[instIdx];
                 // Transform ray to mesh local space using inverse(instance.transform)
-                mat4 invTransform = inverse(inst.transform);
+                mat4 invTransform = inst.inverseTransform;
                 vec3 localOrigin = vec3(invTransform * vec4(ray.origin, 1.0));
                 vec3 localDir = normalize(vec3(invTransform * vec4(ray.direction, 0.0)));
                 Ray localRay = Ray(localOrigin, localDir);
                 float tLocal;
                 vec3 localHit, localNormal;
                 int tempMat;
-                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat, anyHit)) {
+                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat)) {
                     // Transform hit point and normal back to world space
                     vec3 worldHit = vec3(inst.transform * vec4(localHit, 1.0));
                     float tWorld = length(worldHit - ray.origin); // world-space t
                     if (tWorld < tHit) {
                         tHit = tWorld;
                         hitPoint = worldHit;
-                        normal = normalize(mat3(transpose(inverse(inst.transform))) * localNormal);
+                        mat3 normalMatrix = mat3(transpose(inst.inverseTransform));
+                        normal = normalize(normalMatrix * localNormal);
                         materialIndex = tempMat;
                         instanceIdx = instIdx;
                         hit = true;
-                        if (anyHit) return true; // Early exit
                     }
                 }
             }
@@ -509,7 +510,7 @@ bool shadowVisibility(vec3 origin, vec3 dir, float maxDist, out float visibility
     const float EPS = 0.001;
     for (int iter = 0; iter < 32 && visibility > 0.05; ++iter) {
         float tHit; vec3 hp, n; int matIdx; int inst;
-        if (!traverseTLAS(Ray(origin, dir), tHit, hp, n, matIdx, inst, true)) return true; // no more hits
+        if (!traverseTLAS(Ray(origin, dir), tHit, hp, n, matIdx, inst)) return true; // no more hits
         if (tHit < EPS) { origin += dir * EPS; continue; }
         traveled += tHit;
         if (traveled >= maxDist) return true; // reached light
@@ -669,8 +670,8 @@ void main() {
     vec2 seed = uv;
 
     vec3 color = vec3(0.0);
-    int maxBounces = 5;
-    float currentIor = 1.474; // track medium IOR
+    int maxBounces = uniformBounceBudget > 0 ? uniformBounceBudget : 5;
+    float currentIor = 1.0; // track medium IOR (air)
     int numSamples = 1; // increase for better quality
 
     // BVH debug overlay variables
@@ -700,7 +701,7 @@ void main() {
             Material hitMaterial;
 
             // Use TLAS/BLAS traversal for intersection
-            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx, false);
+            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx);
             if (!found) {
                 // Skybox: blueish gradient, less bright
                 float t = 0.5 * (normalize(currentDirection).y + 1.0);
@@ -739,8 +740,9 @@ void main() {
                     // Apply transmission weighting; leave reflection handled by spec direct term
                     currentDirection = refr;
                     currentIor = nextIor;
-                    float transmitWeight = hitMaterial.transparency * (1.0 - fresnel);
-                    throughput *= transmitWeight;
+                    vec3 tint = mix(vec3(1.0), hitMaterial.albedo, hitMaterial.transparency);
+                    vec3 transmitWeight = tint * hitMaterial.transparency * (1.0 - fresnel);
+                    throughput *= clamp(transmitWeight, vec3(0.0), vec3(1.0));
                 }
                 // Advanced: could add chromatic dispersion here by varying IOR per channel
             } else {
