@@ -19,7 +19,16 @@ struct Material {
     float reflectivity;
     float transparency;
     float ior;
+    int texturePattern;
+    float padMaterial;
 };
+
+const int MATERIAL_TEX_NONE   = -1;
+const int MATERIAL_TEX_GRASS  = 0;
+const int MATERIAL_TEX_DIRT   = 1;
+const int MATERIAL_TEX_STONE  = 2;
+const int MATERIAL_TEX_LOG    = 3;
+const int MATERIAL_TEX_LEAVES = 4;
 
 struct Light {
     vec4 positionOrDirection; // w==1.0 for point lights, w==0.0 for directional lights
@@ -107,14 +116,13 @@ uniform int uniformBounceBudget; // <=0 uses default bounce count
 out vec4 FragColor;
 
 // Constants
-const vec3 ambientLightColor = vec3(0.05, 0.05, 0.05);
-
 // Ray structure
 struct Ray {
     vec3 origin;
     vec3 direction;
 };
 
+#ifndef RZ_STRIP_DEBUG_FEATURES
 // FPS overlay font: 8x8 bitmap for digits 0-9 and '.' (11 chars)
 // Each row is a byte, LSB is leftmost pixel
 const int fontWidth = 8;
@@ -181,6 +189,15 @@ vec3 drawFpsString(vec2 fragCoord, vec2 pos, float scale, float fps, vec3 fg, ve
     }
     return col;
 }
+#else
+const int fontWidth = 8;
+const int fontHeight = 8;
+uniform float uniformFps;
+float drawFontChar(int, vec2, vec2, float) { return 0.0; }
+vec3 drawFpsString(vec2 fragCoord, vec2 pos, float scale, float fps, vec3 fg, vec3 bg) {
+    return bg;
+}
+#endif
 
 //------------------------------------------------------------------------------
 // Utility functions
@@ -201,6 +218,254 @@ vec3 randomHemisphereDirection(vec3 normal, vec2 seed) {
     return normalize(tangent * dir.x + bitangent * dir.y + normal * dir.z);
 }
 
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+float hash31(vec3 p) {
+    p = fract(p * vec3(443.8975, 441.423, 437.195));
+    p += dot(p, p.yzx + 19.19);
+    return fract((p.x + p.y) * p.z);
+}
+
+float valueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+    float amplitude = 0.5;
+    float value = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        value += valueNoise(p) * amplitude;
+        p *= 2.37;
+        amplitude *= 0.5;
+    }
+    return value;
+}
+
+float valueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    float n000 = hash31(i);
+    float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+    float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+    float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+    float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+    float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+    float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+    float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+    float nxy0 = mix(nx00, nx10, u.y);
+    float nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+float fbm(vec3 p) {
+    float amplitude = 0.5;
+    float value = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        value += valueNoise(p) * amplitude;
+        p *= 2.437;
+        amplitude *= 0.5;
+    }
+    return value;
+}
+
+vec2 repeatUV(vec2 uv, float scale) {
+    vec2 tiled = uv * scale;
+    return tiled;
+}
+
+vec3 sampleBlockPattern(int pattern, vec2 uv, int axis, vec3 worldPos, vec3 normal, vec3 baseColor) {
+    float localY = fract(worldPos.y + 0.001);
+    if (pattern == MATERIAL_TEX_GRASS) {
+        if (axis == 1 && normal.y > -0.2) {
+            vec2 topUV = repeatUV(uv, 3.2);
+            float broad = fbm(topUV * 3.0);
+            float fine = valueNoise(topUV * 12.0 + float(axis) * 4.0);
+            vec3 shadow = vec3(0.28, 0.50, 0.22);
+            vec3 light = vec3(0.48, 0.78, 0.35);
+            vec3 color = mix(shadow, light, broad);
+            color *= 0.9 + 0.2 * fine;
+            if (normal.y < 0.0) {
+                color *= 0.6;
+            }
+            return color;
+        } else {
+            vec3 dirt = vec3(0.36, 0.25, 0.13);
+            vec3 moss = vec3(0.31, 0.52, 0.24);
+            float blend = smoothstep(0.35, 0.92, localY);
+            float mossNoise = fbm(worldPos * vec3(0.7, 0.9, 0.7) + float(axis) * 3.3);
+            vec3 color = mix(dirt, moss, blend);
+            color *= 0.85 + 0.25 * mossNoise;
+            return color;
+        }
+    }
+    if (pattern == MATERIAL_TEX_DIRT) {
+        vec2 tiled = repeatUV(uv, 2.5);
+        float clumps = fbm(tiled * 2.7 + worldPos.y);
+        float stones = smoothstep(0.65, 0.95, valueNoise(tiled * 4.5));
+        vec3 base = vec3(0.34, 0.24, 0.15);
+        vec3 pebble = vec3(0.52, 0.42, 0.26);
+        vec3 color = mix(base, pebble, stones * 0.6);
+        color *= 0.85 + 0.25 * clumps;
+        return color;
+    }
+    if (pattern == MATERIAL_TEX_STONE) {
+        float strata = fbm(worldPos * 2.2 + float(axis) * 7.7);
+        float veins = fbm(worldPos * 6.0 + vec3(11.0, 3.0, 5.0));
+        vec3 base = mix(vec3(0.40, 0.42, 0.46), vec3(0.64, 0.66, 0.69), strata);
+        base -= veins * 0.08;
+        base *= 0.9 + 0.12 * valueNoise(worldPos.xz * 5.5);
+        return base;
+    }
+    if (pattern == MATERIAL_TEX_LOG) {
+        if (axis == 1) {
+            vec2 local = fract(uv) - 0.5;
+            float radius = length(local);
+            float rings = fract(radius * 18.0 + fbm(local * 24.0));
+            float cracks = fbm(local * 42.0 + worldPos.y);
+            vec3 inner = vec3(0.52, 0.33, 0.18);
+            vec3 outer = vec3(0.30, 0.19, 0.10);
+            vec3 color = mix(inner, outer, smoothstep(0.15, 0.85, rings));
+            color += vec3(0.03, 0.02, 0.015) * cracks;
+            if (normal.y < 0.0) color *= 0.75;
+            return color;
+        } else {
+            vec2 barkUV = vec2(worldPos.y, uv.y);
+            barkUV *= vec2(3.5, 1.8);
+            float grooves = sin(barkUV.x * 6.28318) * 0.5 + 0.5;
+            float cracks = fbm(vec2(barkUV.x * 1.3, barkUV.y * 4.0));
+            vec3 light = vec3(0.42, 0.27, 0.13);
+            vec3 dark = vec3(0.25, 0.16, 0.08);
+            vec3 color = mix(light, dark, grooves * 0.7 + cracks * 0.3);
+            color *= 0.9 + 0.12 * fbm(worldPos.xz * vec2(1.5, 2.4));
+            return color;
+        }
+    }
+    if (pattern == MATERIAL_TEX_LEAVES) {
+        float broad = fbm(worldPos * 3.2 + float(axis));
+        float veins = fbm(worldPos * 6.5 + vec3(7.7, 2.1, 5.5));
+        vec3 deep = vec3(0.18, 0.30, 0.15);
+        vec3 bright = vec3(0.35, 0.58, 0.29);
+        vec3 color = mix(deep, bright, broad);
+        color += vec3(0.05, 0.07, 0.03) * veins;
+        return color;
+    }
+    return baseColor;
+}
+
+vec3 blockTextureColor(int pattern, vec3 worldPos, vec3 normal, vec3 baseColor) {
+    if (pattern == MATERIAL_TEX_NONE) {
+        return baseColor;
+    }
+    vec3 n = normalize(normal);
+    vec3 blend = pow(abs(n), vec3(8.0));
+    blend = max(blend, vec3(1e-4));
+    float sum = blend.x + blend.y + blend.z;
+    blend /= sum;
+
+    vec3 axisX = sampleBlockPattern(pattern, worldPos.yz, 0, worldPos, normal, baseColor);
+    vec3 axisY = sampleBlockPattern(pattern, worldPos.xz, 1, worldPos, normal, baseColor);
+    vec3 axisZ = sampleBlockPattern(pattern, worldPos.xy, 2, worldPos, normal, baseColor);
+    return axisX * blend.x + axisY * blend.y + axisZ * blend.z;
+}
+
+vec3 evaluateMaterialAlbedo(Material material, vec3 worldPos, vec3 normal) {
+    return blockTextureColor(material.texturePattern, worldPos, normal, material.albedo);
+}
+
+vec3 primarySunDirection() {
+    for (int i = 0; i < numLights; ++i) {
+        if (i >= lights.length()) break;
+        Light light = lights[i];
+        if (light.positionOrDirection.w == 0.0) {
+            vec3 dir = light.positionOrDirection.xyz;
+            float len2 = dot(dir, dir);
+            if (len2 > 1e-6) {
+                return dir / sqrt(len2);
+            }
+        }
+    }
+    return normalize(vec3(0.4, 0.85, 0.3));
+}
+
+vec3 sampleSkybox(vec3 dir) {
+    dir = normalize(dir);
+    float up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+
+    vec3 horizon = vec3(0.88, 0.82, 0.74);
+    vec3 zenith = vec3(0.30, 0.48, 0.85);
+    vec3 ground = vec3(0.10, 0.11, 0.12);
+    vec3 baseSky = mix(horizon, zenith, pow(up, 1.2));
+    vec3 base = mix(ground, baseSky, smoothstep(-0.1, 0.95, dir.y));
+
+    vec3 sunDirection = primarySunDirection();
+    float sunDot = max(dot(dir, sunDirection), 0.0);
+    float sunCore = pow(sunDot, 1800.0);
+    float sunHalo = pow(sunDot, 5.0);
+    vec3 sunColor = vec3(1.0, 0.98, 0.9) * (sunCore * 45.0 + sunHalo * 0.45);
+
+    vec3 cloudPos = dir * vec3(4.0, 2.0, 4.0) + vec3(10.0, 25.0, 5.0);
+    float cloudLow = fbm(cloudPos);
+    float cloudHigh = fbm(cloudPos * 2.7 + vec3(0.3, 0.6, 0.2));
+    float cloudField = mix(cloudLow, cloudHigh, 0.55);
+    float clouds = smoothstep(0.48, 0.65, cloudField);
+    clouds *= smoothstep(0.0, 1.0, up);
+    float feather = pow(clouds, 1.3);
+    vec3 cloudColor = mix(vec3(1.0, 0.99, 0.96), vec3(0.95, 0.97, 1.0), up * 0.6);
+    base = mix(base, cloudColor, feather * 0.5);
+
+    base += sunColor;
+    base = mix(base, vec3(1.0), 0.05);
+    return clamp(base, 0.0, 4.0);
+}
+
+vec3 hemisphereAmbient(vec3 normal) {
+    vec3 groundColor = vec3(0.32, 0.27, 0.22);
+    float up = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 envDir = normal.y >= 0.0 ? normal : normalize(vec3(normal.x, 0.05, normal.z));
+    vec3 sky = sampleSkybox(envDir);
+    return mix(groundColor, sky, up);
+}
+
+vec3 applyHeightFog(vec3 incomingColor, vec3 rayDir, float distanceToSurface, vec3 hitPoint) {
+    float travel = max(distanceToSurface, 0.0);
+    float fogStart = 35.0;
+    float fogFull = 220.0;
+    float fogTravel = max(travel - fogStart, 0.0);
+    float distFactor = fogFull > fogStart ? clamp(fogTravel / (fogFull - fogStart), 0.0, 1.0) : 1.0;
+    float heightFactor = clamp((hitPoint.y + 8.0) / 120.0, 0.0, 1.0);
+    float density = mix(0.009, 0.0025, heightFactor);
+    float fog = 1.0 - exp(-fogTravel * density);
+    fog *= distFactor;
+    float horizon = smoothstep(-0.35, 0.45, rayDir.y);
+    vec3 fogHorizon = vec3(0.42, 0.52, 0.66);
+    vec3 fogSky = sampleSkybox(rayDir);
+    vec3 fogColor = mix(fogHorizon, fogSky, horizon);
+    fogColor = mix(fogColor, vec3(0.36, 0.40, 0.48), clamp(0.4 - rayDir.y, 0.0, 1.0) * 0.35);
+    return mix(incomingColor, fogColor, clamp(fog, 0.0, 1.0));
+}
+
+vec3 toneMapACES(vec3 color) {
+    vec3 numerator = color * (2.51 * color + 0.03);
+    vec3 denominator = color * (2.43 * color + 0.59) + 0.14;
+    return clamp(numerator / denominator, 0.0, 1.0);
+}
+
 Ray calculateRay(vec2 uv, vec2 seed) {
     vec2 jitter = vec2(rand(seed), rand(seed + vec2(1.0))) * 0.00002;
     uv += jitter;
@@ -211,6 +476,7 @@ Ray calculateRay(vec2 uv, vec2 seed) {
     return Ray(camera.position, normalize(ray_world));
 }
 
+#ifndef RZ_STRIP_DEBUG_FEATURES
 // Helper: HSV to RGB for gradient coloring
 vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -371,6 +637,15 @@ void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor,
         }
     }
 }
+#else
+vec3 hsv2rgb(vec3 c) { return vec3(0.0); }
+void overlayBVHWireframe(vec2, out float tlasWire, out vec3 tlasColor, out float blasWire, out vec3 blasColor) {
+    tlasWire = 0.0;
+    tlasColor = vec3(0.0);
+    blasWire = 0.0;
+    blasColor = vec3(0.0);
+}
+#endif
 
 //------------------------------------------------------------------------------
 // Intersection functions for TLAS/BLAS
@@ -608,8 +883,14 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         }
         return specAccum;
     }
-    vec3 F0 = mix(vec3(0.04), material.albedo, material.metallic);
-    vec3 finalColor = ambientLightColor * material.albedo;
+    vec3 F0 = mix(vec3(0.02), material.albedo, material.metallic);
+    vec3 ambientIrradiance = hemisphereAmbient(normal) * 0.35;
+    vec3 finalColor = ambientIrradiance * material.albedo;
+    vec3 sunDir = primarySunDirection();
+    float sunWrap = pow(max(dot(normal, sunDir), 0.0), 3.5);
+    float roughResponse = pow(max(1.0 - clamp(material.roughness, 0.0, 1.0), 0.0), 1.4);
+    vec3 sunBounce = vec3(1.0, 0.92, 0.75) * sunWrap * (0.18 * roughResponse);
+    finalColor += sunBounce * material.albedo;
 
     // Loop over lights (assumed 10 lights maximum)
     for (int i = 0; i < numLights; ++i) {
@@ -642,7 +923,8 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
 
         vec3 F = fresnelSchlick(max(dot(halfwayDir, viewDir), 0.0), F0);
 
-        float alpha = material.roughness * material.roughness;
+        float perceptualRoughness = clamp(material.roughness, 0.045, 1.0);
+        float alpha = perceptualRoughness * perceptualRoughness;
         float alpha2 = alpha * alpha;
         float denom = (dot(normal, halfwayDir) * dot(normal, halfwayDir) * (alpha2 - 1.0) + 1.0);
         float D = alpha2 / (3.14159 * denom * denom);
@@ -654,7 +936,13 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         float denomSpec = max(4.0 * NdotV * NdotL, 0.0001);
         vec3 specular = (F * D * G) / denomSpec;
 
-        vec3 diffuse = (1.0 - F) * material.albedo * NdotL / 3.14159;
+        float roughEnergyLoss = pow(clamp(1.0 - perceptualRoughness, 0.0, 1.0), 4.5);
+        float dielectricSpec = material.reflectivity * roughEnergyLoss;
+        float specScale = mix(dielectricSpec, 1.0, material.metallic);
+        specular *= specScale;
+
+        float diffuseScale = (1.0 - material.metallic) * (1.0 - min(specScale * 1.1, 0.95));
+        vec3 diffuse = diffuseScale * (1.0 - F) * material.albedo * NdotL / 3.14159;
 
         finalColor += max(vec3(0.0), (diffuse + specular) * light.color * attenuation);
     }
@@ -703,18 +991,19 @@ void main() {
             // Use TLAS/BLAS traversal for intersection
             bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx);
             if (!found) {
-                // Skybox: blueish gradient, less bright
-                float t = 0.5 * (normalize(currentDirection).y + 1.0);
-                vec3 skyColor = mix(vec3(0.15, 0.25, 0.45), vec3(0.5, 0.7, 1.0), t); // deep blue to light blue
+                vec3 skyColor = sampleSkybox(currentDirection);
                 color += throughput * skyColor;
                 break;
             }
             hitSomething = true;
             hitMaterial = materials[materialIndex];
+            hitMaterial.albedo = evaluateMaterialAlbedo(hitMaterial, hitPoint, hitNormal);
             vec3 viewDir = normalize(camera.position - hitPoint);
             // Only add explicit direct lighting on first bounce to avoid energy blow-up without MIS
             if (bounce == 0) {
-                color += throughput * calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
+                vec3 direct = calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
+                direct = applyHeightFog(direct, currentDirection, closestT, hitPoint);
+                color += throughput * direct;
             }
 
             float randVal = rand(tempseed + vec2(float(samp), float(bounce)));
@@ -746,13 +1035,17 @@ void main() {
                 }
                 // Advanced: could add chromatic dispersion here by varying IOR per channel
             } else {
-                // Opaque: reflect vs diffuse based on reflectivity
-                if (randVal < hitMaterial.reflectivity) {
+                // Opaque: choose glossy vs diffuse based on reflectivity and roughness
+                float glossyProbBase = hitMaterial.reflectivity * pow(clamp(1.0 - hitMaterial.roughness, 0.0, 1.0), 4.0);
+                float glossyProb = mix(glossyProbBase, hitMaterial.reflectivity, hitMaterial.metallic);
+                glossyProb = clamp(glossyProb, 0.0, 0.95);
+                if (randVal < glossyProb) {
                     currentDirection = reflectRay(currentDirection, hitNormal);
-                    throughput *= vec3(0.95); // slight loss to prevent runaway brightness
+                    throughput *= vec3(0.9);
                 } else {
                     currentDirection = randomHemisphereDirection(hitNormal, tempseed);
-                    throughput *= hitMaterial.albedo * 0.4; // lambertian attenuation
+                    float bounceAtten = 0.3 + 0.35 * hitMaterial.roughness;
+                    throughput *= hitMaterial.albedo * bounceAtten * (1.0 - glossyProb);
                 }
             }
             // Offset origin based on direction vs surface normal to avoid self-intersections, especially exiting glass
@@ -770,6 +1063,8 @@ void main() {
         }
     }
     color /= float(numSamples);
+    color = toneMapACES(color);
+    color = pow(color, vec3(1.0/2.2));
     color = clamp(color, 0.0, 1.0);
 
     // Overlay BVH wireframe if enabled
@@ -779,6 +1074,7 @@ void main() {
     }
 
     // Debug: Render light positions as screen-space markers
+#ifndef RZ_STRIP_DEBUG_FEATURES
     if (debugShowLights) {
         for (int i = 0; i < numLights; ++i) {
             if (i >= lights.length()) break;
@@ -817,6 +1113,7 @@ void main() {
         }
     }
     color = mix(color, fpsCol, anyFps);
+#endif
 
     FragColor = vec4(color, 1.0);
 }

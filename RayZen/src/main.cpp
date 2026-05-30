@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cmath>
 #include <algorithm>
+#include <string>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
@@ -28,6 +29,7 @@
 #include "BVH.h"
 #include "Logger.h"
 #include "GameObject.h"
+#include "MinecraftDemo.h"
 
 namespace fs = std::filesystem;
 
@@ -48,6 +50,14 @@ void renderRasterized(const Scene& scene);
 void cleanupRasterMeshes();
 void sendRasterSceneData(GLuint shaderProgram, const Scene& scene);
 void runPathTracerWarmup(GLFWwindow* window, Scene& scene, int warmupFrames);
+struct MiniGameState;
+void setupShardHuntMiniGame(Scene& scene, const std::shared_ptr<Mesh>& shardMesh);
+void resetShardHunt(Scene& scene, MiniGameState& state);
+void startShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window, double now);
+void pauseShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window);
+void updateShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window, double now);
+void refreshShardHuntWindowTitle(GLFWwindow* window, MiniGameState& state, double now);
+glm::vec3 extractTranslation(const glm::mat4& m);
 
 // Global variables
 GLuint quadVAO, quadVBO;
@@ -63,6 +73,32 @@ int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
 int debugSelectedBLAS = 0;
 int debugSelectedTri = 0;
 bool editorMode = false;
+
+
+bool gPreferSpirv = false;
+bool gSpirvSupported = false;
+bool gStripDebugShaderFeatures = false;
+
+struct MiniGameState {
+    bool enabled = false;
+    bool active = false;
+    bool completed = false;
+    float captureRadius = 1.25f;
+    std::vector<size_t> pickupIndices;
+    std::vector<bool> collected;
+    std::vector<glm::mat4> originalTransforms;
+    int collectedCount = 0;
+    double startTime = 0.0;
+    double completionTime = 0.0;
+    double lastTitleUpdateTime = -1.0;
+    std::string lastWindowTitle;
+};
+
+MiniGameState gMiniGame;
+
+bool gMinecraftDemoEnabled = false;
+std::unique_ptr<MinecraftDemo> gMinecraftDemoInstance;
+std::unique_ptr<MinecraftPlayerController> gMinecraftPlayerController;
 
 std::atomic<bool> gPathTracerReady{false};
 std::atomic<GLuint> gPathTracerProgramHandle{0};
@@ -132,12 +168,23 @@ bool loadBVHInstancesFromFile(const std::string& filename, std::vector<BVHInstan
     return loadVectorFromFile(filename, insts);
 }
 
+std::string buildShaderDefineBlock() {
+    std::string block;
+    if (gStripDebugShaderFeatures) {
+        block += "#define RZ_STRIP_DEBUG_FEATURES 1\n";
+    }
+    return block;
+}
+
 int main(int argc, char** argv) {
     // Parse CLI log level and BVH rebuild flag
     LogLevel logLevel = LogLevel::INFO;
     bool forceRebuildBVH = false;
     bool requestPathTracerOnly = false;
     int warmupFrames = 0;
+    bool preferSpirvRequested = false;
+    bool stripDebugShaderRequested = false;
+    bool minecraftDemoRequested = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
@@ -145,6 +192,9 @@ int main(int argc, char** argv) {
         else if (arg == "--log=error") logLevel = LogLevel::ERROR;
         else if (arg == "--rebuild-bvh") forceRebuildBVH = true;
         else if (arg == "--path-tracer-only") requestPathTracerOnly = true;
+        else if (arg == "--prefer-spirv") preferSpirvRequested = true;
+        else if (arg == "--shader-strip-debug") stripDebugShaderRequested = true;
+        else if (arg == "--minecraft-demo") minecraftDemoRequested = true;
         else if (arg.rfind("--warmup-frames=", 0) == 0) {
             std::string value = arg.substr(std::string("--warmup-frames=").size());
             try {
@@ -158,7 +208,17 @@ int main(int argc, char** argv) {
     if (warmupFrames > 0) {
         requestPathTracerOnly = true;
     }
+    gMinecraftDemoEnabled = minecraftDemoRequested;
+    if (gMinecraftDemoEnabled) {
+        forceRebuildBVH = true;
+    }
+    gPreferSpirv = preferSpirvRequested;
+    gStripDebugShaderFeatures = stripDebugShaderRequested;
     Logger::setLevel(logLevel);
+
+    if (gMinecraftDemoEnabled) {
+        Logger::info("Minecraft demo mode enabled (--minecraft-demo)");
+    }
 
     auto startupStart = std::chrono::high_resolution_clock::now();
     auto startupCheckpoint = startupStart;
@@ -196,6 +256,10 @@ int main(int argc, char** argv) {
     Logger::info("B: Toggle BVH wireframe debug");
     Logger::info("N: Toggle BVH debug mode (TLAS/BLAS)");
     Logger::info("F1: Toggle editor raster mode");
+    Logger::info("G: Start/pause shard hunt mini-game");
+    if (gMinecraftDemoEnabled) {
+        Logger::info("Shift: Sprint (Minecraft demo)");
+    }
     Logger::info("ESC: Quit");
     Logger::info("========================");
 
@@ -253,6 +317,17 @@ int main(int argc, char** argv) {
         Logger::info(std::string("GL version: ") + reinterpret_cast<const char*>(glVersion));
     }
     logStartupStep("GLEW init");
+
+    gSpirvSupported = GLEW_ARB_gl_spirv == GL_TRUE;
+    if (gPreferSpirv && !gSpirvSupported) {
+        Logger::info("GL_ARB_gl_spirv not supported; falling back to GLSL sources");
+        gPreferSpirv = false;
+    } else if (gPreferSpirv) {
+        Logger::info("GL_ARB_gl_spirv available; will prefer SPIR-V binaries when present");
+    }
+    if (gStripDebugShaderFeatures) {
+        Logger::info("Shader debug features stripped for faster compilation (defines RZ_STRIP_DEBUG_FEATURES)");
+    }
 
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -327,70 +402,85 @@ int main(int argc, char** argv) {
     // Define scene
     Scene scene;
 
-    // Define camera
-    scene.camera = Camera(
-        glm::vec3(0.0f, 0.0f, 3.0f), // Position
-        glm::vec3(0.0f, 0.0f, -1.0f), // Direction
-        glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
-        70.0f, // FOV
-        float(SCR_WIDTH) / float(SCR_HEIGHT), // Aspect ratio
-        0.1f, // Near plane
-        100.0f // Far plane
-    );
+    if (gMinecraftDemoEnabled) {
+        gMiniGame = MiniGameState{};
+        gMinecraftDemoInstance = std::make_unique<MinecraftDemo>(scene);
+        gMinecraftDemoInstance->initialize();
+        gMinecraftPlayerController = std::make_unique<MinecraftPlayerController>(gMinecraftDemoInstance->world(), scene.camera);
+        logStartupStep("Minecraft scene setup");
+    } else {
+        gMinecraftPlayerController.reset();
+        gMinecraftDemoInstance.reset();
 
-    // Define materials
-    scene.materials = {
-        // 0: Red matte
-        Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
-        // 1: Green metallic (moderate roughness to avoid mirror-like look)
-        Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.35f, 0.3f, 0.0f, 1.5f),
-        // 2: Mirror
-        Material(glm::vec3(1.0f), 1.0f, 0.05f, 1.0f, 0.0f, 1.5f),
-        // 3: Glass (slight blue tint for visibility)
-        Material(glm::vec3(0.85f, 0.95f, 1.0f), 0.0f, 0.02f, 0.05f, 0.94f, 1.5f),
-        // 4: Rough surface
-        Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
-    };
+        scene.camera = Camera(
+            glm::vec3(0.0f, 0.0f, 3.0f), // Position
+            glm::vec3(0.0f, 0.0f, -1.0f), // Direction
+            glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
+            70.0f, // FOV
+            float(SCR_WIDTH) / float(SCR_HEIGHT), // Aspect ratio
+            0.1f, // Near plane
+            100.0f // Far plane
+        );
 
-    // Define lights
-    scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
-    scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
+        scene.materials = {
+            Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
+            Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.35f, 0.3f, 0.0f, 1.5f),
+            Material(glm::vec3(1.0f), 1.0f, 0.05f, 1.0f, 0.0f, 1.5f),
+            Material(glm::vec3(0.85f, 0.95f, 1.0f), 0.0f, 0.02f, 0.05f, 0.94f, 1.5f),
+            Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
+        };
+        scene.materials.emplace_back(glm::vec3(1.2f, 0.9f, 0.25f), 0.0f, 0.15f, 0.2f, 0.0f, 1.4f);
+        int shardMaterialIndex = static_cast<int>(scene.materials.size()) - 1;
 
-    // Define game objects
-    // Create shared meshes
-    auto floorMesh = std::make_shared<Mesh>();
-    auto monkeyMesh = std::make_shared<Mesh>();
-    auto monkey2Mesh = std::make_shared<Mesh>();
-    auto movingCubeMesh = std::make_shared<Mesh>();
-    auto movingCubeMesh2 = std::make_shared<Mesh>();
-    auto movingCubeMesh3 = std::make_shared<Mesh>();
-    auto glassMesh = std::make_shared<Mesh>();
-    loadMeshWithTiming(floorMesh, "../meshes/cube.obj", 0, "floor");
-    loadMeshWithTiming(monkeyMesh, "../meshes/monkey.obj", 1, "monkey A");
-    loadMeshWithTiming(monkey2Mesh, "../meshes/monkey.obj", 2, "monkey B");
-    loadMeshWithTiming(movingCubeMesh, "../meshes/car.obj", 0, "car");
-    loadMeshWithTiming(movingCubeMesh2, "../meshes/monkey.obj", 0, "monkey C");
-    loadMeshWithTiming(movingCubeMesh3, "../meshes/monkey.obj", 0, "monkey D");
-    loadMeshWithTiming(glassMesh, "../meshes/monkey.obj", 3, "glass monkey");
-    logStartupStep("Mesh loading");
+        scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f));
+        scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f));
 
-    // Add GameObjects to the scene
-    scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-4.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh2, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh3, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 4.f))});
-    scene.gameObjects.push_back(GameObject{glassMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(1.2f)), glm::vec3(2.5f, 0.8f, 2.5f))});
-    logStartupStep("Scene graph build");
+        auto floorMesh = std::make_shared<Mesh>();
+        auto monkeyMesh = std::make_shared<Mesh>();
+        auto monkey2Mesh = std::make_shared<Mesh>();
+        auto movingCubeMesh = std::make_shared<Mesh>();
+        auto movingCubeMesh2 = std::make_shared<Mesh>();
+        auto movingCubeMesh3 = std::make_shared<Mesh>();
+        auto glassMesh = std::make_shared<Mesh>();
+        auto shardMesh = std::make_shared<Mesh>();
+        loadMeshWithTiming(floorMesh, "../meshes/cube.obj", 0, "floor");
+        loadMeshWithTiming(monkeyMesh, "../meshes/monkey.obj", 1, "monkey A");
+        loadMeshWithTiming(monkey2Mesh, "../meshes/monkey.obj", 2, "monkey B");
+        loadMeshWithTiming(movingCubeMesh, "../meshes/car.obj", 0, "car");
+        loadMeshWithTiming(movingCubeMesh2, "../meshes/monkey.obj", 0, "monkey C");
+        loadMeshWithTiming(movingCubeMesh3, "../meshes/monkey.obj", 0, "monkey D");
+        loadMeshWithTiming(glassMesh, "../meshes/monkey.obj", 3, "glass monkey");
+        loadMeshWithTiming(shardMesh, "../meshes/monkey.obj", shardMaterialIndex, "shard");
+        logStartupStep("Mesh loading");
+
+        scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
+        scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-4.0f, 0.0f, 0.0f))});
+        scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 0.0f, 0.0f))});
+        scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))});
+        scene.gameObjects.push_back(GameObject{movingCubeMesh2, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.f))});
+        scene.gameObjects.push_back(GameObject{movingCubeMesh3, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 4.f))});
+        scene.gameObjects.push_back(GameObject{glassMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(1.2f)), glm::vec3(2.5f, 0.8f, 2.5f))});
+        size_t glassObjectIndex = scene.gameObjects.size() - 1;
+
+        setupShardHuntMiniGame(scene, shardMesh);
+        logStartupStep("Scene graph build");
+
+        Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(glassObjectIndex));
+        if (gMiniGame.enabled) {
+            Logger::info("Mini-game ready: press G to start the shard hunt and collect all glowing statues");
+        }
+    }
 
     // Initialize SSBOs (initial build)
     initializeSSBOs(scene, forceRebuildBVH);
     logStartupStep("SSBO/BVH init");
     buildRasterMeshes(scene);
     logStartupStep("Raster mesh build");
-    Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(scene.gameObjects.size()-1));
     logStartupStep("Startup ready");
+
+    if (gMiniGame.enabled) {
+        refreshShardHuntWindowTitle(window, gMiniGame, glfwGetTime());
+    }
 
     if (warmupFrames > 0 && shaderProgram != 0) {
         runPathTracerWarmup(window, scene, warmupFrames);
@@ -460,6 +550,21 @@ int main(int argc, char** argv) {
             }
         } else {
             editorKeyPressed = false;
+        }
+
+        static bool shardKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS) {
+            if (!shardKeyPressed && gMiniGame.enabled) {
+                double now = glfwGetTime();
+                if (!gMiniGame.active) {
+                    startShardHunt(scene, gMiniGame, window, now);
+                } else {
+                    pauseShardHunt(scene, gMiniGame, window);
+                }
+                shardKeyPressed = true;
+            }
+        } else {
+            shardKeyPressed = false;
         }
 
         // Toggle debugShowLights with 'L' key
@@ -568,6 +673,10 @@ int main(int argc, char** argv) {
         //    movingCube.transform = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, 0.0f));
         //}
 
+        if (gMiniGame.enabled) {
+            updateShardHunt(scene, gMiniGame, window, glfwGetTime());
+        }
+
         // Update dynamic BVH/SSBOs for game objects
         updateDynamicBVHAndSSBOs(scene);
         auto afterBVH = std::chrono::high_resolution_clock::now();
@@ -597,7 +706,14 @@ int main(int argc, char** argv) {
         }
 
         // Send scene data to the shader
-    int bounceBudget = (frameCounter == 0) ? 1 : 5;
+    int bounceBudget;
+    if (frameCounter == 0) {
+        bounceBudget = 1;
+    } else if (gMinecraftDemoEnabled) {
+        bounceBudget = 3;
+    } else {
+        bounceBudget = 5;
+    }
     sendSceneDataToShader(shaderProgram, scene, bounceBudget);
         auto afterSend = std::chrono::high_resolution_clock::now();
 
@@ -696,6 +812,11 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
+
+    if (gMinecraftPlayerController) {
+        gMinecraftPlayerController->process(window, deltaTime);
+        return;
+    }
     
     // Camera movement
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
@@ -742,6 +863,97 @@ void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     fs::path vertexAbs = fs::absolute(fs::path(vertexPath));
     fs::path fragmentAbs = fs::absolute(fs::path(fragmentPath));
+
+    auto tryLoadSpirvProgram = [&](GLuint& outProgram) -> bool {
+        if (!gPreferSpirv || !gSpirvSupported) {
+            return false;
+        }
+
+        fs::path vertexSpv = vertexAbs;
+        vertexSpv.replace_extension(".spv");
+        fs::path fragmentSpv = fragmentAbs;
+        fragmentSpv.replace_extension(".spv");
+
+        if (!fs::exists(vertexSpv) || !fs::exists(fragmentSpv)) {
+            Logger::info("SPIR-V binaries not found for " + vertexAbs.filename().string() + " / " + fragmentAbs.filename().string() + "; falling back to GLSL sources");
+            return false;
+        }
+
+        auto loadSingleShader = [&](GLenum stage, const fs::path& binaryPath) -> GLuint {
+            std::ifstream file(binaryPath, std::ios::binary | std::ios::ate);
+            if (!file) {
+                Logger::error("Failed to open SPIR-V shader " + binaryPath.string());
+                return 0;
+            }
+            std::streamsize size = file.tellg();
+            if (size <= 0) {
+                Logger::error("SPIR-V shader is empty: " + binaryPath.string());
+                return 0;
+            }
+            std::vector<char> buffer(static_cast<size_t>(size));
+            file.seekg(0, std::ios::beg);
+            file.read(buffer.data(), size);
+            if (!file) {
+                Logger::error("Failed to read SPIR-V shader " + binaryPath.string());
+                return 0;
+            }
+
+            GLuint shader = glCreateShader(stage);
+            glShaderBinary(1, &shader, GL_SHADER_BINARY_FORMAT_SPIR_V_ARB, buffer.data(), static_cast<GLsizei>(buffer.size()));
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR) {
+                Logger::error("glShaderBinary failed for " + binaryPath.string() + " (error code " + std::to_string(err) + ")");
+                glDeleteShader(shader);
+                return 0;
+            }
+            glSpecializeShader(shader, "main", 0, nullptr, nullptr);
+            GLint success = GL_FALSE;
+            glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+            if (success != GL_TRUE) {
+                char infoLog[1024] = {0};
+                glGetShaderInfoLog(shader, sizeof(infoLog), nullptr, infoLog);
+                Logger::error(std::string("SPIR-V specialization failed for ") + binaryPath.string() + ": " + infoLog);
+                glDeleteShader(shader);
+                return 0;
+            }
+            return shader;
+        };
+
+        GLuint vertShader = loadSingleShader(GL_VERTEX_SHADER, vertexSpv);
+        if (vertShader == 0) {
+            return false;
+        }
+        GLuint fragShader = loadSingleShader(GL_FRAGMENT_SHADER, fragmentSpv);
+        if (fragShader == 0) {
+            glDeleteShader(vertShader);
+            return false;
+        }
+
+        GLuint program = glCreateProgram();
+        glAttachShader(program, vertShader);
+        glAttachShader(program, fragShader);
+        glLinkProgram(program);
+        GLint linkStatus = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+        glDeleteShader(vertShader);
+        glDeleteShader(fragShader);
+        if (linkStatus != GL_TRUE) {
+            char infoLog[1024] = {0};
+            glGetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+            Logger::error(std::string("SPIR-V program linking failed: ") + infoLog);
+            glDeleteProgram(program);
+            return false;
+        }
+
+        Logger::info("Linked SPIR-V program for " + vertexAbs.filename().string() + " / " + fragmentAbs.filename().string());
+        outProgram = program;
+        return true;
+    };
+
+    GLuint spirvProgram = 0;
+    if (tryLoadSpirvProgram(spirvProgram)) {
+        return spirvProgram;
+    }
 
     auto toTimestamp = [](const fs::path& path) -> uint64_t {
         std::error_code ec;
@@ -807,6 +1019,19 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
 
     std::string vertexCode = vShaderStream.str();
     std::string fragmentCode = fShaderStream.str();
+
+    std::string defineBlock = buildShaderDefineBlock();
+    auto injectDefines = [&](std::string& source) {
+        if (defineBlock.empty()) return;
+        size_t versionLineEnd = source.find('\n');
+        if (versionLineEnd != std::string::npos) {
+            source.insert(versionLineEnd + 1, defineBlock);
+        } else {
+            source = defineBlock + source;
+        }
+    };
+    injectDefines(vertexCode);
+    injectDefines(fragmentCode);
 
     const char* vShaderCode = vertexCode.c_str();
     const char* fShaderCode = fragmentCode.c_str();
@@ -1410,4 +1635,154 @@ void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
     glEnableVertexAttribArray(0);
 
     glBindVertexArray(0);
+}
+
+glm::vec3 extractTranslation(const glm::mat4& m) {
+    return glm::vec3(m[3]);
+}
+
+void setupShardHuntMiniGame(Scene& scene, const std::shared_ptr<Mesh>& shardMesh) {
+    const std::vector<glm::vec3> shardPositions = {
+        glm::vec3(-3.5f, -1.0f, -3.5f),
+        glm::vec3(3.5f, -1.0f, 2.8f),
+        glm::vec3(0.0f, 0.5f, -1.5f)
+    };
+
+    gMiniGame.pickupIndices.clear();
+    gMiniGame.collected.clear();
+    gMiniGame.originalTransforms.clear();
+    gMiniGame.collectedCount = 0;
+    gMiniGame.active = false;
+    gMiniGame.completed = false;
+    gMiniGame.startTime = 0.0;
+    gMiniGame.completionTime = 0.0;
+    gMiniGame.lastTitleUpdateTime = -1.0;
+    gMiniGame.lastWindowTitle.clear();
+    gMiniGame.captureRadius = 1.4f;
+
+    if (!shardMesh || shardMesh->triangles.empty()) {
+        gMiniGame.enabled = false;
+        Logger::info("Mini-game disabled: shard mesh unavailable");
+        return;
+    }
+
+    for (const auto& pos : shardPositions) {
+        glm::mat4 transform = glm::translate(glm::mat4(1.0f), pos);
+        transform = glm::scale(transform, glm::vec3(0.75f, 0.75f, 0.75f));
+        scene.gameObjects.push_back(GameObject{shardMesh, transform});
+        gMiniGame.pickupIndices.push_back(scene.gameObjects.size() - 1);
+        gMiniGame.originalTransforms.push_back(transform);
+        gMiniGame.collected.push_back(false);
+    }
+
+    gMiniGame.enabled = !gMiniGame.pickupIndices.empty();
+}
+
+void resetShardHunt(Scene& scene, MiniGameState& state) {
+    for (size_t i = 0; i < state.pickupIndices.size() && i < state.originalTransforms.size(); ++i) {
+        size_t objIndex = state.pickupIndices[i];
+        if (objIndex >= scene.gameObjects.size()) {
+            continue;
+        }
+        scene.gameObjects[objIndex].transform = state.originalTransforms[i];
+        state.collected[i] = false;
+    }
+    state.collectedCount = 0;
+    state.completed = false;
+    state.active = false;
+    state.startTime = 0.0;
+    state.completionTime = 0.0;
+    state.lastTitleUpdateTime = -1.0;
+    state.lastWindowTitle.clear();
+}
+
+void startShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window, double now) {
+    resetShardHunt(scene, state);
+    state.active = true;
+    state.startTime = now;
+    Logger::info("Shard hunt started! Collect all glowing statues before time runs out.");
+    refreshShardHuntWindowTitle(window, state, now);
+}
+
+void pauseShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window) {
+    resetShardHunt(scene, state);
+    Logger::info("Shard hunt reset. Press G to start a new round.");
+    refreshShardHuntWindowTitle(window, state, glfwGetTime());
+}
+
+void updateShardHunt(Scene& scene, MiniGameState& state, GLFWwindow* window, double now) {
+    if (!state.enabled || !state.active) {
+        if (state.enabled) {
+            refreshShardHuntWindowTitle(window, state, now);
+        }
+        return;
+    }
+
+    glm::vec3 playerPos = scene.camera.position;
+    bool changed = false;
+    for (size_t i = 0; i < state.pickupIndices.size(); ++i) {
+        if (state.collected[i]) {
+            continue;
+        }
+        size_t objIndex = state.pickupIndices[i];
+        if (objIndex >= scene.gameObjects.size()) {
+            continue;
+        }
+        glm::vec3 shardPos = extractTranslation(scene.gameObjects[objIndex].transform);
+        float distance = glm::length(shardPos - playerPos);
+        if (distance <= state.captureRadius) {
+            state.collected[i] = true;
+            ++state.collectedCount;
+            scene.gameObjects[objIndex].transform = glm::scale(glm::translate(glm::mat4(1.0f), shardPos), glm::vec3(0.1f));
+            Logger::info("Collected shard " + std::to_string(state.collectedCount) + "/" + std::to_string(state.pickupIndices.size()));
+            changed = true;
+        }
+    }
+
+    if (state.collectedCount == static_cast<int>(state.pickupIndices.size()) && !state.completed) {
+        state.active = false;
+        state.completed = true;
+        state.completionTime = now;
+        double elapsed = state.completionTime - state.startTime;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << elapsed;
+        Logger::info("All shards collected in " + oss.str() + " seconds! Press G to play again.");
+        changed = true;
+    }
+
+    if (changed || (state.active && (state.lastTitleUpdateTime < 0.0 || now - state.lastTitleUpdateTime > 0.25))) {
+        refreshShardHuntWindowTitle(window, state, now);
+    }
+}
+
+void refreshShardHuntWindowTitle(GLFWwindow* window, MiniGameState& state, double now) {
+    if (!state.enabled || window == nullptr) {
+        return;
+    }
+
+    if (state.active && state.lastTitleUpdateTime >= 0.0 && (now - state.lastTitleUpdateTime) < 0.2) {
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "RayZen";
+    if (!state.active) {
+        if (state.completed) {
+            double elapsed = state.completionTime - state.startTime;
+            oss << " | Shard Hunt clear: " << std::fixed << std::setprecision(2) << std::max(0.0, elapsed) << "s";
+        } else {
+            oss << " | Press G to start Shard Hunt";
+        }
+    } else {
+        double elapsed = now - state.startTime;
+        oss << " | Shard Hunt " << state.collectedCount << "/" << state.pickupIndices.size();
+        oss << " | " << std::fixed << std::setprecision(1) << std::max(0.0, elapsed) << "s";
+    }
+
+    std::string newTitle = oss.str();
+    if (newTitle != state.lastWindowTitle) {
+        glfwSetWindowTitle(window, newTitle.c_str());
+        state.lastWindowTitle = newTitle;
+    }
+    state.lastTitleUpdateTime = now;
 }
