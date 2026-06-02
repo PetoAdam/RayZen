@@ -4,6 +4,8 @@
 #include <sstream>
 
 bool Mesh::loadFromOBJ(const std::string& filename, int materialIndex) {
+    triangles.clear();
+
     std::ifstream file(filename);
     if (!file.is_open()) {
         Logger::error("Failed to open OBJ file: " + filename);
@@ -28,8 +30,15 @@ bool Mesh::loadFromOBJ(const std::string& filename, int materialIndex) {
             while (iss >> token) {
                 size_t pos = token.find('/');
                 std::string indexStr = (pos == std::string::npos) ? token : token.substr(0, pos);
-                unsigned int index = std::stoi(indexStr);
-                vertexIndices.push_back(index);
+                int index = std::stoi(indexStr);
+                if (index < 0) {
+                    index = static_cast<int>(vertices.size()) + index + 1;
+                }
+                if (index <= 0 || index > static_cast<int>(vertices.size())) {
+                    Logger::error("OBJ face index out of range in: " + filename);
+                    return false;
+                }
+                vertexIndices.push_back(static_cast<unsigned int>(index));
             }
             // Triangulate the face (supports both triangles and polygons)
             if (vertexIndices.size() >= 3) {

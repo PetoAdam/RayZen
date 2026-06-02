@@ -29,6 +29,10 @@
 #include "Logger.h"
 #include "GameObject.h"
 
+#ifndef RAYZEN_SOURCE_DIR
+#define RAYZEN_SOURCE_DIR "."
+#endif
+
 namespace fs = std::filesystem;
 
 // Constants
@@ -39,7 +43,7 @@ unsigned int SCR_HEIGHT = 600;
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime);
 GLuint loadShaders(const char* vertexPath, const char* fragmentPath);
-void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget);
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget, int accumulatedFrames, bool resetAccumulation, int frameIndex);
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO);
 void initializeSSBOs(const Scene& scene, bool forceRebuildBVH = false);
 void updateDynamicBVHAndSSBOs(Scene& scene);
@@ -49,12 +53,57 @@ void cleanupRasterMeshes();
 void sendRasterSceneData(GLuint shaderProgram, const Scene& scene);
 void runPathTracerWarmup(GLFWwindow* window, Scene& scene, int warmupFrames);
 
+struct RenderConfig {
+    int pathTracerBounceBudget = 3;
+    int swapInterval = 0;
+    float displayExposure = 1.0f;
+    float pathTracerAmbient = 0.02f;
+    float rasterAmbient = 0.03f;
+    float pointLightPower = 300.0f;
+    float directionalLightPower = 2.0f;
+    bool accumulationEnabled = true;
+};
+
+struct PathTracerUniformLocations {
+    GLint resolution = -1;
+    GLint numTriangles = -1;
+    GLint numLights = -1;
+    GLint bounceBudget = -1;
+    GLint accumulatedFrames = -1;
+    GLint resetAccumulation = -1;
+    GLint frameIndex = -1;
+    GLint debugShowLights = -1;
+    GLint debugShowBVH = -1;
+    GLint debugBVHMode = -1;
+    GLint debugSelectedBLAS = -1;
+    GLint debugSelectedTri = -1;
+    GLint uniformFps = -1;
+    GLint displayExposure = -1;
+    GLint ambientLightColor = -1;
+    GLint cameraViewMatrix = -1;
+    GLint cameraProjectionMatrix = -1;
+    GLint cameraPosition = -1;
+    GLint cameraInvViewMatrix = -1;
+    GLint cameraInvProjectionMatrix = -1;
+};
+
+struct RasterUniformLocations {
+    GLint view = -1;
+    GLint projection = -1;
+    GLint cameraPosition = -1;
+    GLint numLights = -1;
+    GLint ambientColor = -1;
+    GLint model = -1;
+    GLint normalMatrix = -1;
+};
+
 // Global variables
 GLuint quadVAO, quadVBO;
 GLuint shaderProgram;
 GLuint rasterShaderProgram;
 GLuint triangleSSBO, materialSSBO, lightSSBO;
 GLuint tlasNodeSSBO, tlasTriIdxSSBO, blasNodeSSBO, blasTriIdxSSBO, bvhInstanceSSBO;
+GLuint accumulationTexture = 0;
 float lastFrame = 0.0f;
 float deltaTime = 0.0f;
 bool debugShowLights = false;
@@ -63,6 +112,21 @@ int debugBVHMode = 0; // 0 = TLAS, 1 = BLAS
 int debugSelectedBLAS = 0;
 int debugSelectedTri = 0;
 bool editorMode = false;
+int gRequestedSwapInterval = 0;
+bool gAccumulationDirty = true;
+int gAccumulatedFrames = 0;
+int gAccumulationWidth = 0;
+int gAccumulationHeight = 0;
+glm::mat4 gAccumulationViewMatrix(1.0f);
+glm::mat4 gAccumulationProjectionMatrix(1.0f);
+glm::vec3 gAccumulationCameraPosition(0.0f);
+int gTotalTriangleCount = 0;
+RenderConfig gRenderConfig;
+fs::path gRenderConfigPath;
+fs::file_time_type gRenderConfigTimestamp{};
+bool gRenderConfigTimestampValid = false;
+PathTracerUniformLocations gPathTracerUniforms;
+RasterUniformLocations gRasterUniforms;
 
 std::atomic<bool> gPathTracerReady{false};
 std::atomic<GLuint> gPathTracerProgramHandle{0};
@@ -83,6 +147,356 @@ struct RasterVertex {
 };
 
 static std::unordered_map<const Mesh*, RasterMeshGPU> gRasterMeshCache;
+
+namespace {
+
+void resetPathTracerAccumulation();
+
+std::string trim(const std::string& value) {
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return "";
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+bool parseBool(const std::string& value, bool& out) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+        out = true;
+        return true;
+    }
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+std::string defaultRenderConfigText() {
+    return
+        "# RayZen render configuration\n"
+        "# Edit while the app is running; the renderer hot-reloads this file.\n"
+        "path_tracer_bounce_budget=3\n"
+        "swap_interval=0\n"
+        "display_exposure=1.0\n"
+        "path_tracer_ambient=0.02\n"
+        "raster_ambient=0.03\n"
+        "point_light_power=300.0\n"
+        "directional_light_power=2.0\n"
+        "accumulation_enabled=true\n";
+}
+
+void ensureRenderConfigFileExists(const fs::path& configPath) {
+    if (fs::exists(configPath)) {
+        return;
+    }
+
+    std::error_code ec;
+    fs::create_directories(configPath.parent_path(), ec);
+    std::ofstream configFile(configPath);
+    configFile << defaultRenderConfigText();
+}
+
+bool loadRenderConfigFromFile(const fs::path& configPath, RenderConfig& config, std::string& error) {
+    std::ifstream input(configPath);
+    if (!input.is_open()) {
+        error = "Failed to open render config: " + configPath.string();
+        return false;
+    }
+
+    RenderConfig nextConfig;
+    std::string line;
+    int lineNumber = 0;
+    while (std::getline(input, line)) {
+        ++lineNumber;
+        const std::size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos) {
+            line = line.substr(0, commentPos);
+        }
+        line = trim(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        const std::size_t separatorPos = line.find('=');
+        if (separatorPos == std::string::npos) {
+            error = "Invalid config line " + std::to_string(lineNumber) + ": missing '='";
+            return false;
+        }
+
+        const std::string key = trim(line.substr(0, separatorPos));
+        const std::string value = trim(line.substr(separatorPos + 1));
+
+        try {
+            if (key == "path_tracer_bounce_budget") {
+                nextConfig.pathTracerBounceBudget = std::clamp(std::stoi(value), 1, 16);
+            } else if (key == "swap_interval") {
+                nextConfig.swapInterval = std::clamp(std::stoi(value), 0, 2);
+            } else if (key == "display_exposure") {
+                nextConfig.displayExposure = std::clamp(std::stof(value), 0.05f, 16.0f);
+            } else if (key == "path_tracer_ambient") {
+                nextConfig.pathTracerAmbient = std::clamp(std::stof(value), 0.0f, 1.0f);
+            } else if (key == "raster_ambient") {
+                nextConfig.rasterAmbient = std::clamp(std::stof(value), 0.0f, 1.0f);
+            } else if (key == "point_light_power") {
+                nextConfig.pointLightPower = std::max(0.0f, std::stof(value));
+            } else if (key == "directional_light_power") {
+                nextConfig.directionalLightPower = std::max(0.0f, std::stof(value));
+            } else if (key == "accumulation_enabled") {
+                bool parsed = false;
+                if (!parseBool(value, parsed)) {
+                    error = "Invalid boolean for accumulation_enabled at line " + std::to_string(lineNumber);
+                    return false;
+                }
+                nextConfig.accumulationEnabled = parsed;
+            } else {
+                error = "Unknown config key at line " + std::to_string(lineNumber) + ": " + key;
+                return false;
+            }
+        } catch (const std::exception&) {
+            error = "Invalid value for key '" + key + "' at line " + std::to_string(lineNumber);
+            return false;
+        }
+    }
+
+    config = nextConfig;
+    return true;
+}
+
+void cachePathTracerUniformLocations(GLuint program) {
+    gPathTracerUniforms = {};
+    if (program == 0) {
+        return;
+    }
+
+    gPathTracerUniforms.resolution = glGetUniformLocation(program, "resolution");
+    gPathTracerUniforms.numTriangles = glGetUniformLocation(program, "numTriangles");
+    gPathTracerUniforms.numLights = glGetUniformLocation(program, "numLights");
+    gPathTracerUniforms.bounceBudget = glGetUniformLocation(program, "uniformBounceBudget");
+    gPathTracerUniforms.accumulatedFrames = glGetUniformLocation(program, "uniformAccumulatedFrames");
+    gPathTracerUniforms.resetAccumulation = glGetUniformLocation(program, "uniformResetAccumulation");
+    gPathTracerUniforms.frameIndex = glGetUniformLocation(program, "uniformFrameIndex");
+    gPathTracerUniforms.debugShowLights = glGetUniformLocation(program, "debugShowLights");
+    gPathTracerUniforms.debugShowBVH = glGetUniformLocation(program, "debugShowBVH");
+    gPathTracerUniforms.debugBVHMode = glGetUniformLocation(program, "debugBVHMode");
+    gPathTracerUniforms.debugSelectedBLAS = glGetUniformLocation(program, "debugSelectedBLAS");
+    gPathTracerUniforms.debugSelectedTri = glGetUniformLocation(program, "debugSelectedTri");
+    gPathTracerUniforms.uniformFps = glGetUniformLocation(program, "uniformFps");
+    gPathTracerUniforms.displayExposure = glGetUniformLocation(program, "uniformDisplayExposure");
+    gPathTracerUniforms.ambientLightColor = glGetUniformLocation(program, "uniformAmbientLightColor");
+    gPathTracerUniforms.cameraViewMatrix = glGetUniformLocation(program, "camera.viewMatrix");
+    gPathTracerUniforms.cameraProjectionMatrix = glGetUniformLocation(program, "camera.projectionMatrix");
+    gPathTracerUniforms.cameraPosition = glGetUniformLocation(program, "camera.position");
+    gPathTracerUniforms.cameraInvViewMatrix = glGetUniformLocation(program, "camera.invViewMatrix");
+    gPathTracerUniforms.cameraInvProjectionMatrix = glGetUniformLocation(program, "camera.invProjectionMatrix");
+}
+
+void cacheRasterUniformLocations(GLuint program) {
+    gRasterUniforms = {};
+    if (program == 0) {
+        return;
+    }
+
+    gRasterUniforms.view = glGetUniformLocation(program, "uView");
+    gRasterUniforms.projection = glGetUniformLocation(program, "uProj");
+    gRasterUniforms.cameraPosition = glGetUniformLocation(program, "uCameraPos");
+    gRasterUniforms.numLights = glGetUniformLocation(program, "numLights");
+    gRasterUniforms.ambientColor = glGetUniformLocation(program, "uAmbientColor");
+    gRasterUniforms.model = glGetUniformLocation(program, "uModel");
+    gRasterUniforms.normalMatrix = glGetUniformLocation(program, "uNormalMatrix");
+}
+
+void uploadLightSSBO(const Scene& scene) {
+    if (lightSSBO == 0) {
+        return;
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, scene.lights.size() * sizeof(Light), scene.lights.data());
+}
+
+bool applyRenderConfig(GLFWwindow* window, Scene& scene, const RenderConfig& nextConfig, bool sceneReady) {
+    const RenderConfig previous = gRenderConfig;
+    bool needsAccumulationReset = false;
+
+    if (scene.lights.size() >= 1 && std::abs(scene.lights[0].power - nextConfig.pointLightPower) > 1e-5f) {
+        scene.lights[0].power = nextConfig.pointLightPower;
+        needsAccumulationReset = true;
+    }
+    if (scene.lights.size() >= 2 && std::abs(scene.lights[1].power - nextConfig.directionalLightPower) > 1e-5f) {
+        scene.lights[1].power = nextConfig.directionalLightPower;
+        needsAccumulationReset = true;
+    }
+
+    if (previous.pathTracerBounceBudget != nextConfig.pathTracerBounceBudget ||
+        std::abs(previous.pathTracerAmbient - nextConfig.pathTracerAmbient) > 1e-5f ||
+        previous.accumulationEnabled != nextConfig.accumulationEnabled) {
+        needsAccumulationReset = true;
+    }
+
+    if (window != nullptr && previous.swapInterval != nextConfig.swapInterval) {
+        gRequestedSwapInterval = nextConfig.swapInterval;
+        glfwSwapInterval(gRequestedSwapInterval);
+        Logger::info("Render config: swap interval updated to " + std::to_string(gRequestedSwapInterval));
+    }
+
+    gRenderConfig = nextConfig;
+
+    if (sceneReady) {
+        uploadLightSSBO(scene);
+    }
+
+    if (needsAccumulationReset) {
+        resetPathTracerAccumulation();
+    }
+
+    return true;
+}
+
+void loadInitialRenderConfig(const fs::path& configPath) {
+    ensureRenderConfigFileExists(configPath);
+    std::string error;
+    RenderConfig loadedConfig;
+    if (!loadRenderConfigFromFile(configPath, loadedConfig, error)) {
+        Logger::error(error + "; using defaults");
+        loadedConfig = RenderConfig{};
+    }
+    gRenderConfig = loadedConfig;
+    std::error_code ec;
+    gRenderConfigTimestamp = fs::last_write_time(configPath, ec);
+    gRenderConfigTimestampValid = !ec;
+}
+
+void reloadRenderConfigIfModified(GLFWwindow* window, Scene& scene, double currentTime, bool sceneReady) {
+    static double nextPollTime = 0.0;
+    if (currentTime < nextPollTime || gRenderConfigPath.empty()) {
+        return;
+    }
+    nextPollTime = currentTime + 0.25;
+
+    std::error_code ec;
+    const auto timestamp = fs::last_write_time(gRenderConfigPath, ec);
+    if (ec) {
+        return;
+    }
+    if (gRenderConfigTimestampValid && timestamp == gRenderConfigTimestamp) {
+        return;
+    }
+
+    RenderConfig loadedConfig;
+    std::string error;
+    if (!loadRenderConfigFromFile(gRenderConfigPath, loadedConfig, error)) {
+        Logger::error(error);
+        return;
+    }
+
+    gRenderConfigTimestamp = timestamp;
+    gRenderConfigTimestampValid = true;
+    applyRenderConfig(window, scene, loadedConfig, sceneReady);
+    Logger::info("Reloaded render config from " + gRenderConfigPath.string());
+}
+
+glm::mat4 makeTransform(const glm::vec3& translation, const glm::vec3& scale = glm::vec3(1.0f)) {
+    return glm::translate(glm::mat4(1.0f), translation) * glm::scale(glm::mat4(1.0f), scale);
+}
+
+std::string resolveProjectPath(const fs::path& relativePath) {
+    return (fs::path(RAYZEN_SOURCE_DIR) / relativePath).string();
+}
+
+bool transformsMatch(const std::vector<GameObject>& gameObjects, const std::vector<glm::mat4>& transforms, float epsilon = 1e-5f) {
+    if (gameObjects.size() != transforms.size()) {
+        return false;
+    }
+
+    for (size_t objectIndex = 0; objectIndex < gameObjects.size(); ++objectIndex) {
+        const glm::mat4& lhs = gameObjects[objectIndex].transform;
+        const glm::mat4& rhs = transforms[objectIndex];
+        for (int column = 0; column < 4; ++column) {
+            for (int row = 0; row < 4; ++row) {
+                if (std::abs(lhs[column][row] - rhs[column][row]) > epsilon) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+std::vector<glm::mat4> captureTransforms(const std::vector<GameObject>& gameObjects) {
+    std::vector<glm::mat4> transforms;
+    transforms.reserve(gameObjects.size());
+    for (const auto& object : gameObjects) {
+        transforms.push_back(object.transform);
+    }
+    return transforms;
+}
+
+bool matricesNearlyEqual(const glm::mat4& lhs, const glm::mat4& rhs, float epsilon = 1e-5f) {
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            if (std::abs(lhs[column][row] - rhs[column][row]) > epsilon) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool vectorsNearlyEqual(const glm::vec3& lhs, const glm::vec3& rhs, float epsilon = 1e-5f) {
+    return glm::all(glm::lessThanEqual(glm::abs(lhs - rhs), glm::vec3(epsilon)));
+}
+
+void resetPathTracerAccumulation() {
+    gAccumulationDirty = true;
+    gAccumulatedFrames = 0;
+}
+
+void ensureAccumulationTexture() {
+    if (SCR_WIDTH == 0 || SCR_HEIGHT == 0) {
+        return;
+    }
+
+    if (accumulationTexture == 0) {
+        glGenTextures(1, &accumulationTexture);
+        glBindTexture(GL_TEXTURE_2D, accumulationTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, accumulationTexture);
+    }
+
+    if (gAccumulationWidth != static_cast<int>(SCR_WIDTH) || gAccumulationHeight != static_cast<int>(SCR_HEIGHT)) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, static_cast<GLsizei>(SCR_WIDTH), static_cast<GLsizei>(SCR_HEIGHT), 0, GL_RGBA, GL_FLOAT, nullptr);
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        glClearTexImage(accumulationTexture, 0, GL_RGBA, GL_FLOAT, zero);
+        gAccumulationWidth = static_cast<int>(SCR_WIDTH);
+        gAccumulationHeight = static_cast<int>(SCR_HEIGHT);
+        resetPathTracerAccumulation();
+    }
+
+    glBindImageTexture(0, accumulationTexture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+bool cameraStateMatchesAccumulation(const Camera& camera) {
+    return vectorsNearlyEqual(camera.position, gAccumulationCameraPosition) &&
+           matricesNearlyEqual(camera.viewMatrix, gAccumulationViewMatrix) &&
+           matricesNearlyEqual(camera.projectionMatrix, gAccumulationProjectionMatrix);
+}
+
+void storeAccumulationCameraState(const Camera& camera) {
+    gAccumulationCameraPosition = camera.position;
+    gAccumulationViewMatrix = camera.viewMatrix;
+    gAccumulationProjectionMatrix = camera.projectionMatrix;
+}
+
+} // namespace
 
 struct ShaderBinaryMetadata {
     uint64_t vertexTimestamp = 0;
@@ -132,12 +546,71 @@ bool loadBVHInstancesFromFile(const std::string& filename, std::vector<BVHInstan
     return loadVectorFromFile(filename, insts);
 }
 
+size_t expectedSceneTriangleCount(const Scene& scene) {
+    size_t triangleCount = 0;
+    for (const auto& object : scene.gameObjects) {
+        if (object.mesh) {
+            triangleCount += object.mesh->triangles.size();
+        }
+    }
+    return triangleCount;
+}
+
+uint64_t computeSceneGeometryFingerprint(const Scene& scene) {
+    uint64_t hash = 1469598103934665603ull;
+    const uint64_t prime = 1099511628211ull;
+
+    auto mixBytes = [&](const void* data, size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t index = 0; index < size; ++index) {
+            hash ^= static_cast<uint64_t>(bytes[index]);
+            hash *= prime;
+        }
+    };
+
+    for (const auto& object : scene.gameObjects) {
+        const size_t triangleCount = object.mesh ? object.mesh->triangles.size() : 0;
+        mixBytes(&triangleCount, sizeof(triangleCount));
+        if (!object.mesh) {
+            continue;
+        }
+        for (const auto& triangle : object.mesh->triangles) {
+            mixBytes(&triangle, sizeof(Triangle));
+        }
+    }
+
+    return hash;
+}
+
+uint64_t computeMeshGeometryFingerprint(const Mesh& mesh) {
+    uint64_t hash = 1469598103934665603ull;
+    const uint64_t prime = 1099511628211ull;
+
+    auto mixBytes = [&](const void* data, size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t index = 0; index < size; ++index) {
+            hash ^= static_cast<uint64_t>(bytes[index]);
+            hash *= prime;
+        }
+    };
+
+    const size_t triangleCount = mesh.triangles.size();
+    mixBytes(&triangleCount, sizeof(triangleCount));
+    for (const auto& triangle : mesh.triangles) {
+        mixBytes(&triangle, sizeof(Triangle));
+    }
+
+    return hash;
+}
+
 int main(int argc, char** argv) {
     // Parse CLI log level and BVH rebuild flag
     LogLevel logLevel = LogLevel::INFO;
     bool forceRebuildBVH = false;
     bool requestPathTracerOnly = false;
     int warmupFrames = 0;
+    int swapInterval = 0;
+    bool swapIntervalOverridden = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
@@ -145,6 +618,16 @@ int main(int argc, char** argv) {
         else if (arg == "--log=error") logLevel = LogLevel::ERROR;
         else if (arg == "--rebuild-bvh") forceRebuildBVH = true;
         else if (arg == "--path-tracer-only") requestPathTracerOnly = true;
+        else if (arg.rfind("--swap-interval=", 0) == 0) {
+            std::string value = arg.substr(std::string("--swap-interval=").size());
+            try {
+                swapInterval = std::clamp(std::stoi(value), 0, 2);
+                swapIntervalOverridden = true;
+            } catch (const std::exception&) {
+                std::cerr << "Invalid value for --swap-interval: " << value << std::endl;
+                swapInterval = 0;
+            }
+        }
         else if (arg.rfind("--warmup-frames=", 0) == 0) {
             std::string value = arg.substr(std::string("--warmup-frames=").size());
             try {
@@ -159,6 +642,12 @@ int main(int argc, char** argv) {
         requestPathTracerOnly = true;
     }
     Logger::setLevel(logLevel);
+    gRenderConfigPath = fs::path(RAYZEN_SOURCE_DIR) / "config" / "render_config.ini";
+    loadInitialRenderConfig(gRenderConfigPath);
+    if (swapIntervalOverridden) {
+        gRenderConfig.swapInterval = swapInterval;
+    }
+    gRequestedSwapInterval = gRenderConfig.swapInterval;
 
     auto startupStart = std::chrono::high_resolution_clock::now();
     auto startupCheckpoint = startupStart;
@@ -195,6 +684,7 @@ int main(int argc, char** argv) {
     Logger::info("L: Toggle light debug markers");
     Logger::info("B: Toggle BVH wireframe debug");
     Logger::info("N: Toggle BVH debug mode (TLAS/BLAS)");
+    Logger::info("F2: Toggle swap interval (0/1)");
     Logger::info("F1: Toggle editor raster mode");
     Logger::info("ESC: Quit");
     Logger::info("========================");
@@ -239,7 +729,7 @@ int main(int argc, char** argv) {
         return -1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0); // disable vsync until warm-up completes
+    glfwSwapInterval(gRequestedSwapInterval);
     logStartupStep("GLFW init + window");
 
     // Initialize GLEW
@@ -252,6 +742,14 @@ int main(int argc, char** argv) {
     if (glVersion) {
         Logger::info(std::string("GL version: ") + reinterpret_cast<const char*>(glVersion));
     }
+    GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor();
+    if (primaryMonitor) {
+        const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor);
+        if (videoMode) {
+            Logger::info("Primary monitor refresh rate: " + std::to_string(videoMode->refreshRate) + " Hz");
+        }
+    }
+    Logger::info("Swap interval: " + std::to_string(gRequestedSwapInterval));
     logStartupStep("GLEW init");
 
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
@@ -264,9 +762,22 @@ int main(int argc, char** argv) {
     // Load shaders
     bool awaitingPathTracerReady = false;
     auto rasterCompileStart = std::chrono::high_resolution_clock::now();
-    rasterShaderProgram = loadShaders("../shaders/editor_vertex.glsl", "../shaders/editor_fragment.glsl");
+    const std::string rasterVertexShaderPath = resolveProjectPath("shaders/editor_vertex.glsl");
+    const std::string rasterFragmentShaderPath = resolveProjectPath("shaders/editor_fragment.glsl");
+    const std::string pathTracerVertexShaderPath = resolveProjectPath("shaders/vertex_shader.glsl");
+    const std::string pathTracerFragmentShaderPath = resolveProjectPath("shaders/fragment_shader.glsl");
+    const std::string cubeMeshPath = resolveProjectPath("meshes/cube.obj");
+    const std::string monkeyMeshPath = resolveProjectPath("meshes/monkey.obj");
+    rasterShaderProgram = loadShaders(rasterVertexShaderPath.c_str(), rasterFragmentShaderPath.c_str());
     auto rasterCompileEnd = std::chrono::high_resolution_clock::now();
     Logger::info(std::string("Raster shader compile/link time: ") + std::to_string(std::chrono::duration<double, std::milli>(rasterCompileEnd - rasterCompileStart).count()) + " ms");
+    if (rasterShaderProgram == 0) {
+        Logger::error("Failed to initialize raster shader program");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+    cacheRasterUniformLocations(rasterShaderProgram);
 
     int contextMajor = glfwGetWindowAttrib(window, GLFW_CONTEXT_VERSION_MAJOR);
     int contextMinor = glfwGetWindowAttrib(window, GLFW_CONTEXT_VERSION_MINOR);
@@ -285,10 +796,10 @@ int main(int argc, char** argv) {
             return false;
         }
         gPathTracerCompileWindow = hidden;
-        gPathTracerThread = std::thread([hidden]() {
+        gPathTracerThread = std::thread([hidden, pathTracerVertexShaderPath, pathTracerFragmentShaderPath]() {
             glfwMakeContextCurrent(hidden);
             auto start = std::chrono::high_resolution_clock::now();
-            GLuint program = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+            GLuint program = loadShaders(pathTracerVertexShaderPath.c_str(), pathTracerFragmentShaderPath.c_str());
             auto end = std::chrono::high_resolution_clock::now();
             glFinish();
             gPathTracerProgramHandle.store(program, std::memory_order_release);
@@ -308,11 +819,18 @@ int main(int argc, char** argv) {
             Logger::info("Async path tracer compile unavailable; compiling on primary context");
         }
         auto pathTracerStart = std::chrono::high_resolution_clock::now();
-        shaderProgram = loadShaders("../shaders/vertex_shader.glsl", "../shaders/fragment_shader.glsl");
+        shaderProgram = loadShaders(pathTracerVertexShaderPath.c_str(), pathTracerFragmentShaderPath.c_str());
         auto pathTracerEnd = std::chrono::high_resolution_clock::now();
         gPathTracerCompileMs.store(std::chrono::duration<double, std::milli>(pathTracerEnd - pathTracerStart).count(), std::memory_order_release);
         gPathTracerReady.store(true, std::memory_order_release);
         Logger::info(std::string("Path tracer shader compile/link time: ") + std::to_string(gPathTracerCompileMs.load()) + " ms");
+        if (shaderProgram == 0) {
+            Logger::error("Failed to initialize path tracer shader program");
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            return -1;
+        }
+        cachePathTracerUniformLocations(shaderProgram);
     } else {
         shaderProgram = 0;
         editorMode = true;
@@ -329,10 +847,10 @@ int main(int argc, char** argv) {
 
     // Define camera
     scene.camera = Camera(
-        glm::vec3(0.0f, 0.0f, 3.0f), // Position
-        glm::vec3(0.0f, 0.0f, -1.0f), // Direction
+        glm::vec3(0.0f, 0.75f, 5.5f), // Position
+        glm::normalize(glm::vec3(0.0f, -0.08f, -1.0f)), // Direction
         glm::vec3(0.0f, 1.0f, 0.0f), // Up vector
-        70.0f, // FOV
+        55.0f, // FOV
         float(SCR_WIDTH) / float(SCR_HEIGHT), // Aspect ratio
         0.1f, // Near plane
         100.0f // Far plane
@@ -341,13 +859,13 @@ int main(int argc, char** argv) {
     // Define materials
     scene.materials = {
         // 0: Red matte
-        Material(glm::vec3(0.8f, 0.3f, 0.3f), 0.0f, 1.0f, 0.0f, 0.0f, 1.5f),
+        Material(glm::vec3(0.95f, 0.05f, 0.05f), 0.0f, 0.95f, 0.0f, 0.0f, 1.5f),
         // 1: Green metallic (moderate roughness to avoid mirror-like look)
-        Material(glm::vec3(0.1f, 0.7f, 0.1f), 1.0f, 0.35f, 0.3f, 0.0f, 1.5f),
+        Material(glm::vec3(0.08f, 0.72f, 0.08f), 1.0f, 0.35f, 0.3f, 0.0f, 1.5f),
         // 2: Mirror
         Material(glm::vec3(1.0f), 1.0f, 0.05f, 1.0f, 0.0f, 1.5f),
-        // 3: Glass (slight blue tint for visibility)
-        Material(glm::vec3(0.85f, 0.95f, 1.0f), 0.0f, 0.02f, 0.05f, 0.94f, 1.5f),
+        // 3: Glass (nearly neutral tint)
+        Material(glm::vec3(0.98f, 0.985f, 0.99f), 0.0f, 0.02f, 0.05f, 0.94f, 1.5f),
         // 4: Rough surface
         Material(glm::vec3(0.6f, 0.4f, 0.2f), 0.0f, 0.9f, 0.2f, 0.0f, 1.5f)
     };
@@ -355,45 +873,114 @@ int main(int argc, char** argv) {
     // Define lights
     scene.lights.push_back(Light(glm::vec4(5.0f, 5.0f, 5.0f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 300.0f)); // Point light at (5, 5, 5)
     scene.lights.push_back(Light(glm::vec4(0.8f, 1.4f, 0.3f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f), 2.0f)); // Directional light with direction (0.8, 1.4, 0.3)
+    scene.lights[0].power = gRenderConfig.pointLightPower;
+    scene.lights[1].power = gRenderConfig.directionalLightPower;
 
     // Define game objects
     // Create shared meshes
     auto floorMesh = std::make_shared<Mesh>();
     auto monkeyMesh = std::make_shared<Mesh>();
-    auto monkey2Mesh = std::make_shared<Mesh>();
-    auto movingCubeMesh = std::make_shared<Mesh>();
-    auto movingCubeMesh2 = std::make_shared<Mesh>();
-    auto movingCubeMesh3 = std::make_shared<Mesh>();
     auto glassMesh = std::make_shared<Mesh>();
-    loadMeshWithTiming(floorMesh, "../meshes/cube.obj", 0, "floor");
-    loadMeshWithTiming(monkeyMesh, "../meshes/monkey.obj", 1, "monkey A");
-    loadMeshWithTiming(monkey2Mesh, "../meshes/monkey.obj", 2, "monkey B");
-    loadMeshWithTiming(movingCubeMesh, "../meshes/car.obj", 0, "car");
-    loadMeshWithTiming(movingCubeMesh2, "../meshes/monkey.obj", 0, "monkey C");
-    loadMeshWithTiming(movingCubeMesh3, "../meshes/monkey.obj", 0, "monkey D");
-    loadMeshWithTiming(glassMesh, "../meshes/monkey.obj", 3, "glass monkey");
+    bool loadedFloor = loadMeshWithTiming(floorMesh, cubeMeshPath, 0, "floor");
+    bool loadedMonkey = loadMeshWithTiming(monkeyMesh, monkeyMeshPath, 1, "monkey");
+    bool loadedGlassMonkey = loadMeshWithTiming(glassMesh, monkeyMeshPath, 3, "glass monkey");
+    if (!loadedFloor || !loadedMonkey || !loadedGlassMonkey) {
+        Logger::error("Scene asset loading failed; aborting before cache initialization");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
     logStartupStep("Mesh loading");
 
     // Add GameObjects to the scene
-    scene.gameObjects.push_back(GameObject{floorMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(8.0f, 0.5f, 8.0f)), glm::vec3(0.0f, -3.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkeyMesh, glm::translate(glm::mat4(1.0f), glm::vec3(-4.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{monkey2Mesh, glm::translate(glm::mat4(1.0f), glm::vec3(4.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh2, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -4.f))});
-    scene.gameObjects.push_back(GameObject{movingCubeMesh3, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 4.f))});
-    scene.gameObjects.push_back(GameObject{glassMesh, glm::translate(glm::scale(glm::mat4(1.0f), glm::vec3(1.2f)), glm::vec3(2.5f, 0.8f, 2.5f))});
+    scene.gameObjects.push_back(GameObject{floorMesh, makeTransform(glm::vec3(0.0f, -2.2f, 0.0f), glm::vec3(12.0f, 0.25f, 12.0f))});
+    scene.gameObjects.push_back(GameObject{monkeyMesh, makeTransform(glm::vec3(0.0f, -0.15f, 0.0f), glm::vec3(1.45f))});
+    scene.gameObjects.push_back(GameObject{glassMesh, makeTransform(glm::vec3(2.75f, -0.65f, -1.65f), glm::vec3(0.9f))});
+    gTotalTriangleCount = static_cast<int>(expectedSceneTriangleCount(scene));
     logStartupStep("Scene graph build");
+
+    if (Logger::getLevel() <= LogLevel::DEBUG) {
+        glm::vec3 worldMin(1e30f), worldMax(-1e30f);
+        float closestHit = 1e30f;
+        int closestMaterial = -1;
+
+        auto intersectTriangle = [](const glm::vec3& origin, const glm::vec3& direction, const Triangle& triangle, float& tHit) {
+            const glm::vec3 edge1 = triangle.v1 - triangle.v0;
+            const glm::vec3 edge2 = triangle.v2 - triangle.v0;
+            const glm::vec3 h = glm::cross(direction, edge2);
+            const float a = glm::dot(edge1, h);
+            if (std::abs(a) < 1e-6f) {
+                return false;
+            }
+            const float f = 1.0f / a;
+            const glm::vec3 s = origin - triangle.v0;
+            const float u = f * glm::dot(s, h);
+            if (u < 0.0f || u > 1.0f) {
+                return false;
+            }
+            const glm::vec3 q = glm::cross(s, edge1);
+            const float v = f * glm::dot(direction, q);
+            if (v < 0.0f || u + v > 1.0f) {
+                return false;
+            }
+            const float t = f * glm::dot(edge2, q);
+            if (t <= 1e-4f) {
+                return false;
+            }
+            tHit = t;
+            return true;
+        };
+
+        for (const auto& object : scene.gameObjects) {
+            for (const auto& triangle : object.mesh->triangles) {
+                Triangle worldTriangle = triangle;
+                worldTriangle.v0 = glm::vec3(object.transform * glm::vec4(triangle.v0, 1.0f));
+                worldTriangle.v1 = glm::vec3(object.transform * glm::vec4(triangle.v1, 1.0f));
+                worldTriangle.v2 = glm::vec3(object.transform * glm::vec4(triangle.v2, 1.0f));
+                worldMin = glm::min(worldMin, glm::min(worldTriangle.v0, glm::min(worldTriangle.v1, worldTriangle.v2)));
+                worldMax = glm::max(worldMax, glm::max(worldTriangle.v0, glm::max(worldTriangle.v1, worldTriangle.v2)));
+                float tHit = 0.0f;
+                if (intersectTriangle(scene.camera.position, glm::normalize(scene.camera.target), worldTriangle, tHit) && tHit < closestHit) {
+                    closestHit = tHit;
+                    closestMaterial = worldTriangle.materialIndex;
+                }
+            }
+        }
+
+        Logger::debug("Scene bounds min=" + std::to_string(worldMin.x) + "," + std::to_string(worldMin.y) + "," + std::to_string(worldMin.z) +
+                      " max=" + std::to_string(worldMax.x) + "," + std::to_string(worldMax.y) + "," + std::to_string(worldMax.z));
+        Logger::debug("Camera position=" + std::to_string(scene.camera.position.x) + "," + std::to_string(scene.camera.position.y) + "," + std::to_string(scene.camera.position.z) +
+                      " direction=" + std::to_string(scene.camera.target.x) + "," + std::to_string(scene.camera.target.y) + "," + std::to_string(scene.camera.target.z));
+        if (closestMaterial >= 0) {
+            Logger::debug("Center camera ray hits scene at t=" + std::to_string(closestHit) + " material=" + std::to_string(closestMaterial));
+        } else {
+            Logger::debug("Center camera ray misses the scene");
+        }
+    }
 
     // Initialize SSBOs (initial build)
     initializeSSBOs(scene, forceRebuildBVH);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
     logStartupStep("SSBO/BVH init");
     buildRasterMeshes(scene);
     logStartupStep("Raster mesh build");
-    Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(scene.gameObjects.size()-1));
+    Logger::info("Glass monkey material index 3 at gameObject index " + std::to_string(scene.gameObjects.size() - 1));
     logStartupStep("Startup ready");
+
+    ensureAccumulationTexture();
+    storeAccumulationCameraState(scene.camera);
+    resetPathTracerAccumulation();
 
     if (warmupFrames > 0 && shaderProgram != 0) {
         runPathTracerWarmup(window, scene, warmupFrames);
+        resetPathTracerAccumulation();
         lastFrame = glfwGetTime();
     }
 
@@ -403,8 +990,6 @@ int main(int argc, char** argv) {
     float animTime = 0.0f;
     int frameCounter = 0;
     const int frameLogLimit = 100;
-    const int vsyncRestoreFrame = 5;
-    bool vsyncRestored = false;
     while (!glfwWindowShouldClose(window)) {
         auto frameStart = std::chrono::high_resolution_clock::now();
 
@@ -412,14 +997,15 @@ int main(int argc, char** argv) {
             GLuint program = gPathTracerProgramHandle.exchange(0, std::memory_order_acq_rel);
             if (program != 0) {
                 shaderProgram = program;
+                cachePathTracerUniformLocations(shaderProgram);
                 awaitingPathTracerReady = false;
                 if (!userLockedEditorMode) {
                     editorMode = false;
                 }
                 firstFrame = true;
                 frameCounter = 0;
-                vsyncRestored = false;
-                glfwSwapInterval(0);
+                glfwSwapInterval(gRequestedSwapInterval);
+                resetPathTracerAccumulation();
                 double compileMs = gPathTracerCompileMs.load(std::memory_order_acquire);
                 Logger::info(std::string("Path tracer shader ready (compile/link time: ") + formatMs(compileMs) + " ms)" + (userLockedEditorMode ? std::string(" Press F1 to enable path tracer when ready.") : std::string("")));
             } else {
@@ -433,6 +1019,7 @@ int main(int argc, char** argv) {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
+        reloadRenderConfigIfModified(window, scene, currentFrame, true);
         processInput(window, scene.camera, deltaTime);
         scene.camera.updateViewMatrix();
         auto afterInput = std::chrono::high_resolution_clock::now();
@@ -452,14 +1039,26 @@ int main(int argc, char** argv) {
                         // Reset path tracer first-frame diagnostics when returning from editor mode
                         firstFrame = true;
                         frameCounter = 0;
-                        vsyncRestored = false;
-                        glfwSwapInterval(0);
+                        glfwSwapInterval(gRequestedSwapInterval);
+                        resetPathTracerAccumulation();
                     }
                 }
                 editorKeyPressed = true;
             }
         } else {
             editorKeyPressed = false;
+        }
+
+        static bool swapKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS) {
+            if (!swapKeyPressed) {
+                gRequestedSwapInterval = (gRequestedSwapInterval == 0) ? 1 : 0;
+                glfwSwapInterval(gRequestedSwapInterval);
+                Logger::info("Swap interval set to " + std::to_string(gRequestedSwapInterval));
+                swapKeyPressed = true;
+            }
+        } else {
+            swapKeyPressed = false;
         }
 
         // Toggle debugShowLights with 'L' key
@@ -555,6 +1154,10 @@ int main(int argc, char** argv) {
         scene.camera.aspectRatio = float(SCR_WIDTH) / float(SCR_HEIGHT);
         scene.camera.updateProjectionMatrix();
 
+        if (!cameraStateMatchesAccumulation(scene.camera)) {
+            resetPathTracerAccumulation();
+        }
+
         // Rotate the first cube
         //scene.meshes[0].transform = glm::rotate(scene.meshes[0].transform, deltaTime, glm::vec3(0.0f, 1.0f, 0.0f));
 
@@ -587,54 +1190,57 @@ int main(int argc, char** argv) {
                 double swapMs = std::chrono::duration<double, std::milli>(frameEnd - afterRender).count();
                 Logger::info("Frame " + std::to_string(frameCounter) + " [editor] timings: total=" + formatMs(totalMs) + " ms (input=" + formatMs(inputMs) + ", bvh=" + formatMs(bvhMs) + ", render=" + formatMs(renderMs) + ", swap=" + formatMs(swapMs) + ")");
             }
-            if (!vsyncRestored && frameCounter >= vsyncRestoreFrame) {
-                glfwSwapInterval(1);
-                vsyncRestored = true;
-                Logger::info("Re-enabled vsync after warmup frames");
-            }
             ++frameCounter;
             continue;
         }
 
+        ensureAccumulationTexture();
+        const bool resetAccumulationThisFrame = gAccumulationDirty || !gRenderConfig.accumulationEnabled;
+
+        auto useProgStart = std::chrono::high_resolution_clock::now();
+        glUseProgram(shaderProgram);
+        auto useProgEnd = std::chrono::high_resolution_clock::now();
+        if (firstFrame) {
+            firstUseProgramMs = std::chrono::duration<double, std::milli>(useProgEnd - useProgStart).count();
+        }
+
         // Send scene data to the shader
-    int bounceBudget = (frameCounter == 0) ? 1 : 5;
-    sendSceneDataToShader(shaderProgram, scene, bounceBudget);
+        int bounceBudget = gRenderConfig.pathTracerBounceBudget;
+        const int frameIndex = gRenderConfig.accumulationEnabled ? gAccumulatedFrames : frameCounter;
+        sendSceneDataToShader(shaderProgram, scene, bounceBudget, gAccumulatedFrames, resetAccumulationThisFrame, frameIndex);
         auto afterSend = std::chrono::high_resolution_clock::now();
 
-        // Set debugShowLights uniform
-        GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
-        glUniform1i(debugLoc, debugShowLights ? 1 : 0);
-        // Set debugShowBVH uniform
-        GLint bvhLoc = glGetUniformLocation(shaderProgram, "debugShowBVH");
-        glUniform1i(bvhLoc, debugShowBVH ? 1 : 0);
-        // Set debugBVHMode uniform
-        GLint modeLoc = glGetUniformLocation(shaderProgram, "debugBVHMode");
-        glUniform1i(modeLoc, debugBVHMode);
-        // Set debugSelectedBLAS and debugSelectedTri uniforms
-        GLint selBLASLoc = glGetUniformLocation(shaderProgram, "debugSelectedBLAS");
-        glUniform1i(selBLASLoc, debugSelectedBLAS);
-        GLint selTriLoc = glGetUniformLocation(shaderProgram, "debugSelectedTri");
-        glUniform1i(selTriLoc, debugSelectedTri);
+        if (gPathTracerUniforms.debugShowLights >= 0) {
+            glUniform1i(gPathTracerUniforms.debugShowLights, debugShowLights ? 1 : 0);
+        }
+        if (gPathTracerUniforms.debugShowBVH >= 0) {
+            glUniform1i(gPathTracerUniforms.debugShowBVH, debugShowBVH ? 1 : 0);
+        }
+        if (gPathTracerUniforms.debugBVHMode >= 0) {
+            glUniform1i(gPathTracerUniforms.debugBVHMode, debugBVHMode);
+        }
+        if (gPathTracerUniforms.debugSelectedBLAS >= 0) {
+            glUniform1i(gPathTracerUniforms.debugSelectedBLAS, debugSelectedBLAS);
+        }
+        if (gPathTracerUniforms.debugSelectedTri >= 0) {
+            glUniform1i(gPathTracerUniforms.debugSelectedTri, debugSelectedTri);
+        }
 
         // Render the quad
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        auto useProgStart = std::chrono::high_resolution_clock::now();
-        glUseProgram(shaderProgram);
         // Set FPS uniform for overlay
         static float smoothedFps = 0.0f;
         float fps = (deltaTime > 0.0f) ? (1.0f / deltaTime) : 0.0f;
         float alpha = 0.1f; // Smoothing factor (0.0 = no smoothing, 1.0 = instant)
         if (smoothedFps == 0.0f) smoothedFps = fps;
         else smoothedFps = alpha * fps + (1.0f - alpha) * smoothedFps;
-        GLint fpsLoc = glGetUniformLocation(shaderProgram, "uniformFps");
-        glUniform1f(fpsLoc, smoothedFps);
-        auto useProgEnd = std::chrono::high_resolution_clock::now();
-        if (firstFrame) {
-            firstUseProgramMs = std::chrono::duration<double, std::milli>(useProgEnd - useProgStart).count();
+        if (gPathTracerUniforms.uniformFps >= 0) {
+            glUniform1f(gPathTracerUniforms.uniformFps, smoothedFps);
         }
         glBindVertexArray(quadVAO);
         auto drawStart = std::chrono::high_resolution_clock::now();
         glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         auto drawEnd = std::chrono::high_resolution_clock::now();
         if (firstFrame) {
             firstDrawMs = std::chrono::duration<double, std::milli>(drawEnd - drawStart).count();
@@ -646,12 +1252,6 @@ int main(int argc, char** argv) {
         glfwSwapBuffers(window);
         glfwPollEvents();
         auto frameEnd = std::chrono::high_resolution_clock::now();
-
-        if (!vsyncRestored && frameCounter >= vsyncRestoreFrame) {
-            glfwSwapInterval(1);
-            vsyncRestored = true;
-            Logger::info("Re-enabled vsync after warmup frames");
-        }
 
         if (frameCounter < frameLogLimit) {
             double totalMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
@@ -666,8 +1266,20 @@ int main(int argc, char** argv) {
 
         // Print fps on a single line at the bottom of the terminal only in DEBUG mode
         if (Logger::getLevel() <= LogLevel::DEBUG) {
-            std::cout << "\rFPS: " << (1.0/deltaTime) << "    "  << std::endl;
+            static double lastFpsPrintAt = 0.0;
+            if (currentFrame - lastFpsPrintAt >= 0.25) {
+                std::cout << "\rFPS: " << (1.0 / deltaTime) << "    " << std::flush;
+                lastFpsPrintAt = currentFrame;
+            }
         }
+
+        gAccumulationDirty = false;
+        if (gRenderConfig.accumulationEnabled) {
+            ++gAccumulatedFrames;
+        } else {
+            gAccumulatedFrames = 0;
+        }
+        storeAccumulationCameraState(scene.camera);
     }
 
     // Cleanup
@@ -679,6 +1291,9 @@ int main(int argc, char** argv) {
         gPathTracerCompileWindow = nullptr;
     }
     cleanupRasterMeshes();
+    if (accumulationTexture != 0) {
+        glDeleteTextures(1, &accumulationTexture);
+    }
     glDeleteVertexArrays(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
 
@@ -691,6 +1306,7 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     SCR_WIDTH = width;
     SCR_HEIGHT = height;
     glViewport(0, 0, width, height);
+    resetPathTracerAccumulation();
 }
 
 void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
@@ -800,6 +1416,10 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     // Read vertex and fragment shader files
     std::ifstream vShaderFile(vertexAbs);
     std::ifstream fShaderFile(fragmentAbs);
+    if (!vShaderFile.is_open() || !fShaderFile.is_open()) {
+        Logger::error("Failed to open shader sources: " + vertexAbs.string() + " and/or " + fragmentAbs.string());
+        return 0;
+    }
     std::stringstream vShaderStream, fShaderStream;
 
     vShaderStream << vShaderFile.rdbuf();
@@ -821,6 +1441,8 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     if (!success) {
         glGetShaderInfoLog(vertex, 512, nullptr, infoLog);
         Logger::error(std::string("Vertex Shader Compilation Error: ") + infoLog);
+        glDeleteShader(vertex);
+        return 0;
     }
 
     // Compile fragment shader
@@ -831,6 +1453,9 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     if (!success) {
         glGetShaderInfoLog(fragment, 512, nullptr, infoLog);
         Logger::error(std::string("Fragment Shader Compilation Error: ") + infoLog);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        return 0;
     }
 
     // Link shaders
@@ -845,6 +1470,10 @@ GLuint loadShaders(const char* vertexPath, const char* fragmentPath) {
     if (!success) {
         glGetProgramInfoLog(shaderProgram, 512, nullptr, infoLog);
         Logger::error(std::string("Shader Program Linking Error: ") + infoLog);
+        glDeleteShader(vertex);
+        glDeleteShader(fragment);
+        glDeleteProgram(shaderProgram);
+        return 0;
     }
 
     glDeleteShader(vertex);
@@ -911,14 +1540,21 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
     std::vector<int> tlasTriIndices;
     bool loadedSSBOCache = false;
     std::string ssboCachePrefix = cacheDir + "ssbo_v2_";
+    const size_t expectedTriangles = expectedSceneTriangleCount(scene);
+    const uint64_t expectedFingerprint = computeSceneGeometryFingerprint(scene);
+    const std::string sceneFingerprintPath = ssboCachePrefix + "fingerprint.bin";
     if (!forceRebuildBVH &&
         fs::exists(ssboCachePrefix + "triangles.bin") &&
         fs::exists(ssboCachePrefix + "blasnodes.bin") &&
         fs::exists(ssboCachePrefix + "blastris.bin") &&
         fs::exists(ssboCachePrefix + "instances.bin") &&
         fs::exists(ssboCachePrefix + "tlasnodes.bin") &&
-        fs::exists(ssboCachePrefix + "tlastris.bin")) {
+        fs::exists(ssboCachePrefix + "tlastris.bin") &&
+        fs::exists(sceneFingerprintPath)) {
+        uint64_t cachedFingerprint = 0;
+        std::ifstream fingerprintFile(sceneFingerprintPath, std::ios::binary);
         loadedSSBOCache =
+            fingerprintFile.read(reinterpret_cast<char*>(&cachedFingerprint), sizeof(cachedFingerprint)).good() &&
             loadVectorFromFile(ssboCachePrefix + "triangles.bin", allTriangles) &&
             loadVectorFromFile(ssboCachePrefix + "blasnodes.bin", allBLASNodes) &&
             loadVectorFromFile(ssboCachePrefix + "blastris.bin", allBLASTriIndices) &&
@@ -929,6 +1565,16 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             // Invalidate if scene object count changed since cache write
             if (meshInstances.size() != scene.gameObjects.size()) {
                 Logger::info("Cache invalidated: game object count changed (was " + std::to_string(meshInstances.size()) + ", now " + std::to_string(scene.gameObjects.size()) + ")");
+                loadedSSBOCache = false;
+                allTriangles.clear(); allBLASNodes.clear(); allBLASTriIndices.clear();
+                meshInstances.clear(); tlasNodes.clear(); tlasTriIndices.clear();
+            } else if (cachedFingerprint != expectedFingerprint) {
+                Logger::info("Cache invalidated: scene geometry fingerprint changed");
+                loadedSSBOCache = false;
+                allTriangles.clear(); allBLASNodes.clear(); allBLASTriIndices.clear();
+                meshInstances.clear(); tlasNodes.clear(); tlasTriIndices.clear();
+            } else if (allTriangles.size() != expectedTriangles || allBLASTriIndices.size() != expectedTriangles) {
+                Logger::info("Cache invalidated: geometry triangle count changed (cache has " + std::to_string(allTriangles.size()) + ", scene has " + std::to_string(expectedTriangles) + ")");
                 loadedSSBOCache = false;
                 allTriangles.clear(); allBLASNodes.clear(); allBLASTriIndices.clear();
                 meshInstances.clear(); tlasNodes.clear(); tlasTriIndices.clear();
@@ -954,17 +1600,32 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
             const auto& meshTris = mesh->triangles;
             std::string meshName = "mesh" + std::to_string(i);
             std::string blasBase = cacheDir + meshName;
+            std::string blasFingerprintPath = blasBase + ".fingerprint.bin";
             bool loaded = false;
-            if (!forceRebuildBVH && fs::exists(blasBase + ".nodes.bin") && fs::exists(blasBase + ".tris.bin")) {
-                loaded = loadBVHFromFile(blasBase, meshBLAS[i]);
+            if (!forceRebuildBVH &&
+                fs::exists(blasBase + ".nodes.bin") &&
+                fs::exists(blasBase + ".tris.bin") &&
+                fs::exists(blasFingerprintPath)) {
+                uint64_t cachedMeshFingerprint = 0;
+                uint64_t expectedMeshFingerprint = computeMeshGeometryFingerprint(*mesh);
+                std::ifstream fingerprintFile(blasFingerprintPath, std::ios::binary);
+                if (fingerprintFile.read(reinterpret_cast<char*>(&cachedMeshFingerprint), sizeof(cachedMeshFingerprint)).good() &&
+                    cachedMeshFingerprint == expectedMeshFingerprint) {
+                    loaded = loadBVHFromFile(blasBase, meshBLAS[i]);
+                }
                 if (loaded) {
-                    Logger::info("Loaded BLAS from cache for " + meshName);
+                    Logger::info("Loaded BLAS from cache for " + meshName + " (" + std::to_string(meshBLAS[i].nodes.size()) + " nodes)");
+                } else if (cachedMeshFingerprint != expectedMeshFingerprint) {
+                    Logger::info("BLAS cache invalidated for " + meshName + ": mesh geometry fingerprint changed");
                 }
             }
             if (!loaded) {
                 Logger::info("Building BLAS from scratch for " + meshName);
                 meshBLAS[i].buildBLAS(meshTris);
                 saveBVHToFile(blasBase, meshBLAS[i]);
+                uint64_t meshFingerprint = computeMeshGeometryFingerprint(*mesh);
+                std::ofstream fingerprintFile(blasFingerprintPath, std::ios::binary);
+                fingerprintFile.write(reinterpret_cast<const char*>(&meshFingerprint), sizeof(meshFingerprint));
                 Logger::info("Saved BLAS to cache for " + meshName);
             }
 
@@ -1009,23 +1670,9 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         BVH tlas;
         tlas.nodes.clear();
         tlas.triIndices.clear();
-        std::string tlasBase = cacheDir + "scene_tlas";
-        bool loadedTLAS = false;
-        if (!forceRebuildBVH && loadedAllBLAS && fs::exists(tlasBase + ".nodes.bin") && fs::exists(tlasBase + ".tris.bin") && fs::exists(cacheDir + "instances.bin")) {
-            loadedTLAS = loadBVHFromFile(tlasBase, tlas) && loadBVHInstancesFromFile(cacheDir + "instances.bin", meshInstances);
-            if (loadedTLAS) {
-                Logger::info("Loaded TLAS and BVHInstances from cache");
-            }
-        }
-        if (!loadedTLAS) {
-            Logger::info("Building TLAS from scratch");
-            tlas.nodes.clear();
-            tlas.triIndices.clear();
-            tlas.buildTLAS(meshInstances, worldRootNodes);
-            saveBVHToFile(tlasBase, tlas);
-            saveBVHInstancesToFile(cacheDir + "instances.bin", meshInstances);
-            Logger::info("Saved TLAS and BVHInstances to cache");
-        }
+        Logger::info("Building TLAS from current scene transforms");
+        tlas.buildTLAS(meshInstances, worldRootNodes);
+        saveBVHInstancesToFile(cacheDir + "instances.bin", meshInstances);
 
         allBLASNodes.clear();
         allBLASTriIndices.clear();
@@ -1042,6 +1689,8 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
         saveVectorToFile(ssboCachePrefix + "instances.bin", meshInstances);
         saveVectorToFile(ssboCachePrefix + "tlasnodes.bin", tlasNodes);
         saveVectorToFile(ssboCachePrefix + "tlastris.bin", tlasTriIndices);
+        std::ofstream fingerprintFile(sceneFingerprintPath, std::ios::binary);
+        fingerprintFile.write(reinterpret_cast<const char*>(&expectedFingerprint), sizeof(expectedFingerprint));
         Logger::info("Saved SSBO data to cache");
 
         for (size_t i = 0; i < tlasTriIndices.size(); ++i) {
@@ -1121,24 +1770,27 @@ void initializeSSBOs(const Scene& scene, bool forceRebuildBVH) {
 
 // Dynamic BVH/SSBO update for game objects
 void updateDynamicBVHAndSSBOs(Scene& scene) {
-    // 1. Build BLAS for each unique mesh only once (unless geometry changes)
     static std::vector<BVH> meshBLAS;
     static std::vector<BVHNode> meshRootNodes;
-    static bool first = true;
-    if (first || meshBLAS.size() != scene.gameObjects.size()) {
+    static std::vector<glm::mat4> previousTransforms;
+    if (meshBLAS.size() != scene.gameObjects.size()) {
         meshBLAS.resize(scene.gameObjects.size());
         meshRootNodes.resize(scene.gameObjects.size());
         for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
             meshBLAS[i].buildBLAS(scene.gameObjects[i].mesh->triangles);
             meshRootNodes[i] = meshBLAS[i].nodes[0];
         }
-        first = false;
+        previousTransforms.clear();
     }
-    // 2. Build BVHInstances for all objects (with current transform)
+
+    if (transformsMatch(scene.gameObjects, previousTransforms)) {
+        return;
+    }
+
     std::vector<BVHInstance> meshInstances;
+    meshInstances.reserve(scene.gameObjects.size());
     for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
         BVHInstance inst;
-        // Compute node/tri/globalTri offsets for this mesh in the concatenated BLAS buffers
         inst.blasNodeOffset = 0;
         inst.blasTriOffset = 0;
         inst.globalTriOffset = 0;
@@ -1148,26 +1800,14 @@ void updateDynamicBVHAndSSBOs(Scene& scene) {
             inst.globalTriOffset += static_cast<int>(scene.gameObjects[j].mesh->triangles.size());
         }
         inst.transform = scene.gameObjects[i].transform;
-    inst.inverseTransform = glm::inverse(scene.gameObjects[i].transform);
+        inst.inverseTransform = glm::inverse(scene.gameObjects[i].transform);
         inst.meshIndex = static_cast<int>(i);
         meshInstances.push_back(inst);
     }
-    // 3. Flatten all BLAS nodes/indices for GPU
-    std::vector<BVHNode> allBLASNodes;
-    std::vector<int> allBLASTriIndices;
-    for (size_t i = 0; i < meshBLAS.size(); ++i) {
-        allBLASNodes.insert(allBLASNodes.end(), meshBLAS[i].nodes.begin(), meshBLAS[i].nodes.end());
-        allBLASTriIndices.insert(allBLASTriIndices.end(), meshBLAS[i].triIndices.begin(), meshBLAS[i].triIndices.end());
-    }
-    // 4. Combine all triangles (object space, not transformed)
-    std::vector<Triangle> allTriangles;
-    for (const auto& obj : scene.gameObjects) {
-        allTriangles.insert(allTriangles.end(), obj.mesh->triangles.begin(), obj.mesh->triangles.end());
-    }
-    // 5. Rebuild TLAS every frame (since transforms may change)
+
     std::vector<BVHNode> instanceRootNodes;
+    instanceRootNodes.reserve(scene.gameObjects.size());
     for (size_t i = 0; i < scene.gameObjects.size(); ++i) {
-        // Transform mesh AABB by instance transform
         const BVHNode& meshRoot = meshRootNodes[i];
         glm::vec3 corners[8];
         corners[0] = meshRoot.boundsMin;
@@ -1190,21 +1830,15 @@ void updateDynamicBVHAndSSBOs(Scene& scene) {
         instanceRootNodes.push_back(instRoot);
     }
     static BVH tlas;
-    //Logger::info("[updateDynamicBVHAndSSBOs] meshInstances size: " + std::to_string(meshInstances.size()) + ", instanceRootNodes size: " + std::to_string(instanceRootNodes.size()));
     tlas.buildTLAS(meshInstances, instanceRootNodes);
-    // 6. Update SSBOs
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangleSSBO);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allTriangles.size() * sizeof(Triangle), allTriangles.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasNodeSSBO);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allBLASNodes.size() * sizeof(BVHNode), allBLASNodes.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blasTriIdxSSBO);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, allBLASTriIndices.size() * sizeof(int), allBLASTriIndices.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvhInstanceSSBO);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, meshInstances.size() * sizeof(BVHInstance), meshInstances.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasNodeSSBO);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, tlas.nodes.size() * sizeof(BVHNode), tlas.nodes.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, tlasTriIdxSSBO);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, tlas.triIndices.size() * sizeof(int), tlas.triIndices.data());
+
+    previousTransforms = captureTransforms(scene.gameObjects);
 }
 
 void buildRasterMeshes(const Scene& scene) {
@@ -1260,13 +1894,20 @@ void buildRasterMeshes(const Scene& scene) {
 }
 
 void sendRasterSceneData(GLuint shaderProgram, const Scene& scene) {
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "uView"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "uProj"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
-    glUniform3fv(glGetUniformLocation(shaderProgram, "uCameraPos"), 1, glm::value_ptr(scene.camera.position));
-    glUniform1i(glGetUniformLocation(shaderProgram, "numLights"), static_cast<int>(scene.lights.size()));
-    GLint ambientLoc = glGetUniformLocation(shaderProgram, "uAmbientColor");
-    if (ambientLoc >= 0) {
-        glUniform3f(ambientLoc, 0.03f, 0.03f, 0.03f);
+    if (gRasterUniforms.view >= 0) {
+        glUniformMatrix4fv(gRasterUniforms.view, 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
+    }
+    if (gRasterUniforms.projection >= 0) {
+        glUniformMatrix4fv(gRasterUniforms.projection, 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
+    }
+    if (gRasterUniforms.cameraPosition >= 0) {
+        glUniform3fv(gRasterUniforms.cameraPosition, 1, glm::value_ptr(scene.camera.position));
+    }
+    if (gRasterUniforms.numLights >= 0) {
+        glUniform1i(gRasterUniforms.numLights, static_cast<int>(scene.lights.size()));
+    }
+    if (gRasterUniforms.ambientColor >= 0) {
+        glUniform3f(gRasterUniforms.ambientColor, gRenderConfig.rasterAmbient, gRenderConfig.rasterAmbient, gRenderConfig.rasterAmbient);
     }
 }
 
@@ -1276,12 +1917,6 @@ void renderRasterized(const Scene& scene) {
 
     glUseProgram(rasterShaderProgram);
     sendRasterSceneData(rasterShaderProgram, scene);
-
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
-
-    GLint modelLoc = glGetUniformLocation(rasterShaderProgram, "uModel");
-    GLint normalLoc = glGetUniformLocation(rasterShaderProgram, "uNormalMatrix");
 
     for (const auto& obj : scene.gameObjects) {
         const Mesh* meshPtr = obj.mesh.get();
@@ -1294,11 +1929,11 @@ void renderRasterized(const Scene& scene) {
         glm::mat4 model = obj.transform;
         glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(model)));
 
-        if (modelLoc >= 0) {
-            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+        if (gRasterUniforms.model >= 0) {
+            glUniformMatrix4fv(gRasterUniforms.model, 1, GL_FALSE, glm::value_ptr(model));
         }
-        if (normalLoc >= 0) {
-            glUniformMatrix3fv(normalLoc, 1, GL_FALSE, glm::value_ptr(normalMatrix));
+        if (gRasterUniforms.normalMatrix >= 0) {
+            glUniformMatrix3fv(gRasterUniforms.normalMatrix, 1, GL_FALSE, glm::value_ptr(normalMatrix));
         }
 
         glBindVertexArray(gpu.vao);
@@ -1329,66 +1964,85 @@ void runPathTracerWarmup(GLFWwindow* window, Scene& scene, int warmupFrames) {
     glfwHideWindow(window);
     glfwSwapInterval(0);
     for (int i = 0; i < warmupFrames; ++i) {
-        int bounceBudget = (i == 0) ? 1 : 5;
-        sendSceneDataToShader(shaderProgram, scene, bounceBudget);
-        GLint debugLoc = glGetUniformLocation(shaderProgram, "debugShowLights");
-        glUniform1i(debugLoc, debugShowLights ? 1 : 0);
-        GLint bvhLoc = glGetUniformLocation(shaderProgram, "debugShowBVH");
-        glUniform1i(bvhLoc, debugShowBVH ? 1 : 0);
-        GLint modeLoc = glGetUniformLocation(shaderProgram, "debugBVHMode");
-        glUniform1i(modeLoc, debugBVHMode);
-        GLint selBLASLoc = glGetUniformLocation(shaderProgram, "debugSelectedBLAS");
-        glUniform1i(selBLASLoc, debugSelectedBLAS);
-        GLint selTriLoc = glGetUniformLocation(shaderProgram, "debugSelectedTri");
-        glUniform1i(selTriLoc, debugSelectedTri);
+        ensureAccumulationTexture();
+        glUseProgram(shaderProgram);
+        int bounceBudget = (i == 0) ? 1 : gRenderConfig.pathTracerBounceBudget;
+        sendSceneDataToShader(shaderProgram, scene, bounceBudget, 0, true, i);
+        if (gPathTracerUniforms.debugShowLights >= 0) {
+            glUniform1i(gPathTracerUniforms.debugShowLights, debugShowLights ? 1 : 0);
+        }
+        if (gPathTracerUniforms.debugShowBVH >= 0) {
+            glUniform1i(gPathTracerUniforms.debugShowBVH, debugShowBVH ? 1 : 0);
+        }
+        if (gPathTracerUniforms.debugBVHMode >= 0) {
+            glUniform1i(gPathTracerUniforms.debugBVHMode, debugBVHMode);
+        }
+        if (gPathTracerUniforms.debugSelectedBLAS >= 0) {
+            glUniform1i(gPathTracerUniforms.debugSelectedBLAS, debugSelectedBLAS);
+        }
+        if (gPathTracerUniforms.debugSelectedTri >= 0) {
+            glUniform1i(gPathTracerUniforms.debugSelectedTri, debugSelectedTri);
+        }
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         glFinish();
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
     glBindVertexArray(0);
     glfwShowWindow(window);
+    glfwSwapInterval(gRequestedSwapInterval);
     Logger::info("Warm-up complete; first on-screen frame should reuse the cached pipeline");
 }
 
-void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget) {
-    glUseProgram(shaderProgram);
-    
-    // Send resolution uniform
-    glUniform2f(glGetUniformLocation(shaderProgram, "resolution"), float(SCR_WIDTH), float(SCR_HEIGHT));
-    
-    // Send camera data
+void sendSceneDataToShader(GLuint shaderProgram, const Scene& scene, int bounceBudget, int accumulatedFrames, bool resetAccumulation, int frameIndex) {
     glm::mat4 invViewMatrix = glm::inverse(scene.camera.viewMatrix);
     glm::mat4 invProjMatrix = glm::inverse(scene.camera.projectionMatrix);
 
-    // Send the number of triangles
-    int totalTriangles = 0;
-    for (const auto& obj : scene.gameObjects) {
-        totalTriangles += obj.mesh->triangles.size();
+    if (gPathTracerUniforms.resolution >= 0) {
+        glUniform2f(gPathTracerUniforms.resolution, float(SCR_WIDTH), float(SCR_HEIGHT));
     }
-    glUniform1i(glGetUniformLocation(shaderProgram, "numTriangles"), totalTriangles);
-    glUniform1i(glGetUniformLocation(shaderProgram, "numLights"), (int)scene.lights.size());
-    glUniform1i(glGetUniformLocation(shaderProgram, "uniformBounceBudget"), bounceBudget);
-
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.viewMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.projectionMatrix"), 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
-    glUniform3fv(glGetUniformLocation(shaderProgram, "camera.position"), 1, glm::value_ptr(scene.camera.position));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invViewMatrix"), 1, GL_FALSE, glm::value_ptr(invViewMatrix));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "camera.invProjectionMatrix"), 1, GL_FALSE, glm::value_ptr(invProjMatrix));
-    
-    // Bind the SSBOs
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, triangleSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, materialSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, lightSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tlasNodeSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tlasTriIdxSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, blasNodeSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, blasTriIdxSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, bvhInstanceSSBO);
-
-    
+    if (gPathTracerUniforms.numTriangles >= 0) {
+        glUniform1i(gPathTracerUniforms.numTriangles, gTotalTriangleCount);
+    }
+    if (gPathTracerUniforms.numLights >= 0) {
+        glUniform1i(gPathTracerUniforms.numLights, static_cast<int>(scene.lights.size()));
+    }
+    if (gPathTracerUniforms.bounceBudget >= 0) {
+        glUniform1i(gPathTracerUniforms.bounceBudget, bounceBudget);
+    }
+    if (gPathTracerUniforms.accumulatedFrames >= 0) {
+        glUniform1i(gPathTracerUniforms.accumulatedFrames, gRenderConfig.accumulationEnabled ? accumulatedFrames : 0);
+    }
+    if (gPathTracerUniforms.resetAccumulation >= 0) {
+        glUniform1i(gPathTracerUniforms.resetAccumulation, resetAccumulation ? 1 : 0);
+    }
+    if (gPathTracerUniforms.frameIndex >= 0) {
+        glUniform1i(gPathTracerUniforms.frameIndex, frameIndex);
+    }
+    if (gPathTracerUniforms.displayExposure >= 0) {
+        glUniform1f(gPathTracerUniforms.displayExposure, gRenderConfig.displayExposure);
+    }
+    if (gPathTracerUniforms.ambientLightColor >= 0) {
+        glUniform3f(gPathTracerUniforms.ambientLightColor, gRenderConfig.pathTracerAmbient, gRenderConfig.pathTracerAmbient, gRenderConfig.pathTracerAmbient);
+    }
+    if (gPathTracerUniforms.cameraViewMatrix >= 0) {
+        glUniformMatrix4fv(gPathTracerUniforms.cameraViewMatrix, 1, GL_FALSE, glm::value_ptr(scene.camera.viewMatrix));
+    }
+    if (gPathTracerUniforms.cameraProjectionMatrix >= 0) {
+        glUniformMatrix4fv(gPathTracerUniforms.cameraProjectionMatrix, 1, GL_FALSE, glm::value_ptr(scene.camera.projectionMatrix));
+    }
+    if (gPathTracerUniforms.cameraPosition >= 0) {
+        glUniform3fv(gPathTracerUniforms.cameraPosition, 1, glm::value_ptr(scene.camera.position));
+    }
+    if (gPathTracerUniforms.cameraInvViewMatrix >= 0) {
+        glUniformMatrix4fv(gPathTracerUniforms.cameraInvViewMatrix, 1, GL_FALSE, glm::value_ptr(invViewMatrix));
+    }
+    if (gPathTracerUniforms.cameraInvProjectionMatrix >= 0) {
+        glUniformMatrix4fv(gPathTracerUniforms.cameraInvProjectionMatrix, 1, GL_FALSE, glm::value_ptr(invProjMatrix));
+    }
 }
 
 void setupQuad(GLuint& quadVAO, GLuint& quadVBO) {
