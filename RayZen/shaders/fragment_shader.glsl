@@ -108,15 +108,15 @@ uniform int uniformBounceBudget; // <=0 uses default bounce count
 uniform int uniformAccumulatedFrames;
 uniform bool uniformResetAccumulation;
 uniform int uniformFrameIndex;
+uniform float uniformDisplayExposure;
+uniform vec3 uniformAmbientLightColor;
 
 out vec4 FragColor;
 
 // Constants
-const vec3 ambientLightColor = vec3(0.02, 0.02, 0.02);
 const float PI = 3.14159265359;
 const float RAY_EPSILON = 0.002;
 const float MIN_ROUGHNESS = 0.05;
-const float DISPLAY_EXPOSURE = 1.0;
 
 // Ray structure
 struct Ray {
@@ -477,8 +477,29 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
                 }
             }
         } else { // internal
-            stack[stackPtr++] = node.leftFirst;
-            stack[stackPtr++] = node.leftFirst + 1;
+            int leftIdx = node.leftFirst;
+            int rightIdx = node.leftFirst + 1;
+            BVHNode leftNode = blasNodes[blasNodeOffset + leftIdx];
+            BVHNode rightNode = blasNodes[blasNodeOffset + rightIdx];
+
+            float leftTMin, leftTMax;
+            float rightTMin, rightTMax;
+            bool hitLeft = intersectAABB(ray.origin, invDir, leftNode.boundsMin, leftNode.boundsMax, leftTMin, leftTMax) && leftTMin <= tHit;
+            bool hitRight = intersectAABB(ray.origin, invDir, rightNode.boundsMin, rightNode.boundsMax, rightTMin, rightTMax) && rightTMin <= tHit;
+
+            if (hitLeft && hitRight) {
+                if (leftTMin < rightTMin) {
+                    stack[stackPtr++] = rightIdx;
+                    stack[stackPtr++] = leftIdx;
+                } else {
+                    stack[stackPtr++] = leftIdx;
+                    stack[stackPtr++] = rightIdx;
+                }
+            } else if (hitLeft) {
+                stack[stackPtr++] = leftIdx;
+            } else if (hitRight) {
+                stack[stackPtr++] = rightIdx;
+            }
         }
     }
     return hit;
@@ -526,8 +547,29 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                 }
             }
         } else { // internal
-            stack[stackPtr++] = node.leftFirst;
-            stack[stackPtr++] = node.leftFirst + 1;
+            int leftIdx = node.leftFirst;
+            int rightIdx = node.leftFirst + 1;
+            BVHNode leftNode = tlasNodes[leftIdx];
+            BVHNode rightNode = tlasNodes[rightIdx];
+
+            float leftTMin, leftTMax;
+            float rightTMin, rightTMax;
+            bool hitLeft = intersectAABB(ray.origin, invDir, leftNode.boundsMin, leftNode.boundsMax, leftTMin, leftTMax) && leftTMin <= tHit;
+            bool hitRight = intersectAABB(ray.origin, invDir, rightNode.boundsMin, rightNode.boundsMax, rightTMin, rightTMax) && rightTMin <= tHit;
+
+            if (hitLeft && hitRight) {
+                if (leftTMin < rightTMin) {
+                    stack[stackPtr++] = rightIdx;
+                    stack[stackPtr++] = leftIdx;
+                } else {
+                    stack[stackPtr++] = leftIdx;
+                    stack[stackPtr++] = rightIdx;
+                }
+            } else if (hitLeft) {
+                stack[stackPtr++] = leftIdx;
+            } else if (hitRight) {
+                stack[stackPtr++] = rightIdx;
+            }
         }
     }
     return hit;
@@ -639,7 +681,7 @@ vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewD
         return specAccum;
     }
     vec3 F0 = mix(vec3(0.04), material.albedo, material.metallic);
-    vec3 finalColor = ambientLightColor * material.albedo;
+    vec3 finalColor = uniformAmbientLightColor * material.albedo;
 
     // Loop over lights (assumed 10 lights maximum)
     for (int i = 0; i < numLights; ++i) {
@@ -810,7 +852,7 @@ void main() {
     }
     imageStore(accumulationImage, pixelCoord, vec4(accumulatedRadiance, 1.0));
 
-    vec3 color = acesToneMap(accumulatedRadiance * DISPLAY_EXPOSURE);
+    vec3 color = acesToneMap(accumulatedRadiance * uniformDisplayExposure);
     color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
 
     // Overlay BVH wireframe if enabled
