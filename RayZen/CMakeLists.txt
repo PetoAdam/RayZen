@@ -24,6 +24,7 @@ set(RAYZEN_SOURCES
 	${CMAKE_SOURCE_DIR}/src/Renderer/MaterialSettings.cpp
 	${CMAKE_SOURCE_DIR}/src/Renderer/SettingsPanel.cpp
 	${CMAKE_SOURCE_DIR}/src/Renderer/WarmWindow.cpp
+	${CMAKE_SOURCE_DIR}/src/Renderer/FluidDemo.cpp
 	${CMAKE_SOURCE_DIR}/src/Renderer/GLResources.cpp
 	${CMAKE_SOURCE_DIR}/src/Renderer/SceneGPU.cpp
 	${CMAKE_SOURCE_DIR}/src/Renderer/CausticPass.cpp
@@ -85,6 +86,17 @@ add_executable(rayzen_settings_tests
 target_include_directories(rayzen_settings_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(rayzen_settings_tests glfw OpenGL::GL GLEW::GLEW glm::glm Threads::Threads)
 add_test(NAME rayzen_settings_tests COMMAND rayzen_settings_tests)
+
+add_executable(rayzen_fluid_tests
+	${CMAKE_SOURCE_DIR}/tests/fluid_demo.cpp
+	${CMAKE_SOURCE_DIR}/src/Renderer/FluidDemo.cpp
+	${CMAKE_SOURCE_DIR}/src/Renderer/GLResources.cpp
+)
+target_include_directories(rayzen_fluid_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(rayzen_fluid_tests PRIVATE RAYZEN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(rayzen_fluid_tests glfw OpenGL::GL GLEW::GLEW glm::glm Threads::Threads)
+add_test(NAME rayzen_fluid_tests COMMAND rayzen_fluid_tests)
+set_tests_properties(rayzen_fluid_tests PROPERTIES SKIP_RETURN_CODE 77)
 
 set(STARTUP_TEST_PROJECT "${CMAKE_CURRENT_BINARY_DIR}/startup_test_project")
 file(MAKE_DIRECTORY "${STARTUP_TEST_PROJECT}/shaders")

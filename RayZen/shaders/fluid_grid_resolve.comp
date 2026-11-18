@@ -1,0 +1,12 @@
+#version 430 core
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(std430, binding = 3) readonly buffer Grid { uint density[]; };
+layout(r32f, binding = 0) writeonly uniform image3D fieldImage;
+uniform ivec3 gridSize;
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, gridSize))) return;
+    int index = p.x + gridSize.x * (p.y + gridSize.y * p.z);
+    imageStore(fieldImage, p, vec4(float(density[index]) / 1024.0));
+}

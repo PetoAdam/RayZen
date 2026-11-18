@@ -1,0 +1,29 @@
+#version 430 core
+layout(local_size_x = 64) in;
+
+struct Particle { vec4 position; vec4 velocity; };
+layout(std430, binding = 0) readonly buffer Positions { Particle particles[]; };
+layout(std430, binding = 3) buffer Grid { uint density[]; };
+uniform int particleCount;
+uniform ivec3 gridSize;
+uniform vec3 gridMin;
+uniform vec3 gridMax;
+uniform float particleRadius;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+    vec3 cellSize = (gridMax - gridMin) / vec3(gridSize);
+    vec3 center = particles[i].position.xyz;
+    ivec3 first = max(ivec3(floor((center - particleRadius - gridMin) / cellSize)), ivec3(0));
+    ivec3 last = min(ivec3(floor((center + particleRadius - gridMin) / cellSize)), gridSize - 1);
+    for (int z = first.z; z <= last.z; ++z)
+        for (int y = first.y; y <= last.y; ++y)
+            for (int x = first.x; x <= last.x; ++x) {
+                vec3 position = gridMin + (vec3(x, y, z) + 0.5) * cellSize;
+                float weight = max(0.0, 1.0 - length(position - center) / particleRadius);
+                uint value = uint(weight * weight * 1024.0);
+                if (value != 0u)
+                    atomicAdd(density[x + gridSize.x * (y + gridSize.y * z)], value);
+            }
+}

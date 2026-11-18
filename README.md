@@ -77,6 +77,37 @@ triplet and matching MSVC runtime above were tested; keep the source tree and
 assets available when running the executable. Preparation and cache-only
 launches must use the same working directory for the BVH cache.
 
+### Fluid demonstrations
+
+From `RayZen/build`, run either independent GPU particle simulation:
+
+```bash
+./RayZen --fluid=2d
+./RayZen --fluid=3d
+```
+
+Hold the left mouse button to push particles or the right button to pull them.
+In 3D the interaction point lies on the world-space `z=0` plane. Space pauses,
+R resets, and Escape exits. The 3D demonstration includes a rotating obstacle.
+
+These are original, simplified SPH-inspired simulations, not a Unity shader
+port or a reproduction of its simulation and rendering. The 2D view draws
+particles; the 3D view deposits particle density into a GPU 3D grid and
+raymarches an isosurface with approximate reflection and refraction.
+It does not produce a triangle mesh or integrate fluid with RayZen's
+ray/path tracing, BVH, shadows, materials, foam, or caustics. Neighbor
+evaluation is all-pairs, so cost scales quadratically with particle count;
+the demos currently use 340 particles in 2D and 1,000 in 3D. A spatial
+neighbor grid and integration with the existing scene ray tracer would be
+needed for larger or integrated scenes.
+
+Use `--fluid=3d --benchmark-frames=100` (or `2d`) for a synchronized
+800x600 measurement: ten warm-up frames are discarded, then each measured
+frame advances two fixed 1/120-second simulation steps and renders. This
+measures throughput, not wall-clock simulation speed or startup JIT.
+Shader binaries use the normal driver-dependent cache; fluid mode currently
+does not support cache preparation or cache-only mode.
+
 ### Controls & Debug
 - **WASD**: Move camera
 - **Mouse Drag (LMB)**: Rotate camera

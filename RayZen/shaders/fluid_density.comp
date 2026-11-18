@@ -1,0 +1,19 @@
+#version 430 core
+layout(local_size_x = 64) in;
+
+struct Particle { vec4 position; vec4 velocity; };
+layout(std430, binding = 0) readonly buffer Positions { Particle particles[]; };
+layout(std430, binding = 1) writeonly buffer Densities { float densities[]; };
+uniform int particleCount;
+uniform float smoothingRadius;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+    float density = 0.0;
+    for (int j = 0; j < particleCount; ++j) {
+        float q = max(0.0, 1.0 - length(particles[i].position.xyz - particles[j].position.xyz) / smoothingRadius);
+        density += q * q;
+    }
+    densities[i] = density;
+}

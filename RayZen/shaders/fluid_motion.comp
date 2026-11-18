@@ -1,0 +1,78 @@
+#version 430 core
+layout(local_size_x = 64) in;
+
+struct Particle { vec4 position; vec4 velocity; };
+layout(std430, binding = 0) readonly buffer InputParticles { Particle source[]; };
+layout(std430, binding = 1) readonly buffer Densities { float densities[]; };
+layout(std430, binding = 2) writeonly buffer OutputParticles { Particle destination[]; };
+uniform int particleCount;
+uniform int dimensions;
+uniform float smoothingRadius;
+uniform float timeStep;
+uniform vec3 interactionPoint;
+uniform float interactionStrength;
+uniform float obstacleAngle;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+    vec3 position = source[i].position.xyz;
+    vec3 velocity = source[i].velocity.xyz;
+    float targetDensity = dimensions == 2 ? 3.2 : 3.5;
+    float pressure = max(densities[i] - targetDensity, 0.0);
+    vec3 acceleration = vec3(0.0, -3.2, 0.0);
+    vec3 pointerDelta = position - interactionPoint;
+    float pointerDistance = length(pointerDelta);
+    if (pointerDistance > 0.00001 && pointerDistance < 0.8)
+        acceleration += pointerDelta / pointerDistance * interactionStrength * (1.0 - pointerDistance / 0.8);
+    for (int j = 0; j < particleCount; ++j) {
+        if (j == int(i)) continue;
+        vec3 delta = position - source[j].position.xyz;
+        float distance = length(delta);
+        if (distance < 0.00001 || distance >= smoothingRadius) continue;
+        float weight = 1.0 - distance / smoothingRadius;
+        float otherPressure = max(densities[j] - targetDensity, 0.0);
+        acceleration += delta / distance * (pressure + otherPressure) * 9.0 * weight /
+                        max(densities[j], 1.0);
+        acceleration += (source[j].velocity.xyz - velocity) * 0.8 * weight /
+                        max(densities[j], 1.0);
+    }
+    velocity += acceleration * timeStep;
+    float speed = length(velocity);
+    if (speed > 5.0) velocity *= 5.0 / speed;
+    position += velocity * timeStep;
+    if (dimensions == 3) {
+        float c = cos(obstacleAngle), s = sin(obstacleAngle);
+        mat3 rotation = mat3(c, 0, -s, 0, 1, 0, s, 0, c);
+        vec3 center = vec3(0.0, -1.02, 0.0);
+        vec3 halfSize = vec3(0.17, 0.62, 0.48);
+        vec3 local = transpose(rotation) * (position - center);
+        vec3 penetration = halfSize - abs(local);
+        if (all(greaterThan(penetration, vec3(0.0)))) {
+            int axis = penetration.x < penetration.y && penetration.x < penetration.z ? 0 :
+                       (penetration.y < penetration.z ? 1 : 2);
+            vec3 localNormal = vec3(0.0);
+            localNormal[axis] = local[axis] >= 0.0 ? 1.0 : -1.0;
+            local[axis] = localNormal[axis] * (halfSize[axis] + 0.001);
+            position = center + rotation * local;
+            vec3 normal = rotation * localNormal;
+            vec3 obstacleVelocity = cross(vec3(0.0, 0.65, 0.0), position - center);
+            vec3 relative = velocity - obstacleVelocity;
+            velocity -= normal * min(dot(relative, normal), 0.0) * 1.2;
+        }
+    }
+    vec3 lower = vec3(-2.0, -1.65, -1.2);
+    vec3 upper = vec3(2.0, 1.8, 1.2);
+    for (int axis = 0; axis < dimensions; ++axis) {
+        if (position[axis] < lower[axis]) {
+            position[axis] = lower[axis];
+            velocity[axis] = abs(velocity[axis]) * 0.35;
+        } else if (position[axis] > upper[axis]) {
+            position[axis] = upper[axis];
+            velocity[axis] = -abs(velocity[axis]) * 0.35;
+        }
+    }
+    if (dimensions == 2) { position.z = 0.0; velocity.z = 0.0; }
+    destination[i].position = vec4(position, 1.0);
+    destination[i].velocity = vec4(velocity, 0.0);
+}

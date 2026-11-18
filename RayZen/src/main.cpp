@@ -36,6 +36,7 @@
 #include "Renderer/Renderer.h"
 #include "Renderer/RenderConfig.h"
 #include "Renderer/MaterialSettings.h"
+#include "Renderer/FluidDemo.h"
 
 #ifndef RAYZEN_SOURCE_DIR
 #define RAYZEN_SOURCE_DIR "."
@@ -218,7 +219,9 @@ int main(int argc, char** argv) {
     bool prepareShaders = false;
     bool prepareBVH = false;
     bool shaderCacheOnly = false;
+    bool explicitPathTracerOnly = false;
     std::vector<std::string> texturePaths;
+    std::string fluidMode;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log=debug") logLevel = LogLevel::DEBUG;
@@ -231,7 +234,7 @@ int main(int argc, char** argv) {
         else if (arg == "--cache-only") { shaderCacheOnly = true; options.cacheOnly = true; }
         else if (arg == "--shader-cache-only") shaderCacheOnly = true;
         else if (arg == "--bvh-cache-only") options.cacheOnly = true;
-        else if (arg == "--path-tracer-only") options.requestPathTracerOnly = true;
+        else if (arg == "--path-tracer-only") { options.requestPathTracerOnly = true; explicitPathTracerOnly = true; }
         else if (arg == "--keep-warm") options.keepWarm = true;
         else if (arg == "--restore-warm" || arg == "--quit-warm") {
             std::cerr << arg << " must be used without other arguments\n";
@@ -242,6 +245,13 @@ int main(int argc, char** argv) {
         else if (arg == "--no-wsl-d3d12-override") wslD3D12Override = false;
         else if (arg == "--auto-warmup") autoWarmupEnabled = true;
         else if (arg == "--no-auto-warmup") autoWarmupEnabled = false;
+        else if (arg.rfind("--fluid=", 0) == 0) {
+            fluidMode = arg.substr(8);
+            if (fluidMode != "2d" && fluidMode != "3d") {
+                std::cerr << "--fluid requires 2d or 3d\n";
+                return EXIT_FAILURE;
+            }
+        }
         else if (arg == "--allow-backend-fallback") options.requireComputeWhenConfigured = false;
         else if (arg.rfind("--config=", 0) == 0) {
             options.configPath = arg.substr(std::string("--config=").size());
@@ -296,6 +306,12 @@ int main(int argc, char** argv) {
         }
     }
     const bool prepareCache = prepareShaders || prepareBVH;
+    if (!fluidMode.empty() && (prepareCache || shaderCacheOnly || options.cacheOnly || options.keepWarm ||
+                               options.forceRebuildBVH || explicitPathTracerOnly || options.warmupFrames > 0 || autoWarmupEnabled ||
+                               !options.configPath.empty() || !texturePaths.empty())) {
+        std::cerr << "--fluid cannot be combined with scene, cache, warm window or shader warmup options\n";
+        return EXIT_FAILURE;
+    }
     if ((prepareCache && (shaderCacheOnly || options.cacheOnly)) ||
         (options.cacheOnly && options.forceRebuildBVH)) {
         std::cerr << "Preparation cannot be combined with load-only modes; "
@@ -316,7 +332,7 @@ int main(int argc, char** argv) {
 
     maybeEnableWslD3D12Overrides(wslD3D12Override);
 
-    printControls();
+    if (fluidMode.empty()) printControls();
 
     if (!glfwInit()) {
         Logger::error("Failed to initialize GLFW");
@@ -383,6 +399,21 @@ int main(int argc, char** argv) {
     }
     if (softwareRenderer) {
         Logger::info("Software renderer allowed by CLI override.");
+    }
+
+    if (!fluidMode.empty()) {
+        bool success = false;
+        glfwSetWindowTitle(window, fluidMode == "2d" ? "RayZen Fluid 2D" : "RayZen Fluid 3D");
+        if (options.swapIntervalOverridden) glfwSwapInterval(options.overrideSwapInterval);
+        {
+            rayzen::FluidDemo fluid;
+            success = fluid.initialize(fs::path(RAYZEN_SOURCE_DIR) / "shaders",
+                fluidMode == "2d" ? rayzen::FluidDimension::Two : rayzen::FluidDimension::Three);
+            if (success) success = fluid.run(window, options.benchmarkFrames);
+        }
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return success ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (!prepareCache && !shaderCacheOnly && autoWarmupEnabled && options.warmupFrames == 0 && isWslD3D12Renderer(glVendor, glRenderer)) {
