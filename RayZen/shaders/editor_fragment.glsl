@@ -7,6 +7,8 @@ struct Material {
     float reflectivity;
     float transparency;
     float ior;
+    float subsurfaceMeanFreePath;
+    int baseColorTexture;
 };
 
 struct Light {
@@ -26,41 +28,29 @@ layout(std430, binding = 2) buffer LightBuffer {
 uniform vec3 uCameraPos;
 uniform vec3 uAmbientColor;
 uniform int numLights;
+layout(binding = 1) uniform sampler2DArray materialTextures;
 
 in VS_OUT {
     vec3 worldPos;
     vec3 normal;
     flat int materialIndex;
+    vec2 uv;
 } fs_in;
 
 out vec4 FragColor;
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
-}
-
-float distributionGGX(float NdotH, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / max(3.14159 * denom * denom, 1e-4);
-}
-
-float geometrySchlickGGX(float NdotV, float roughness) {
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    return NdotV / (NdotV * (1.0 - k) + k + 1e-6);
-}
+const float PI = 3.14159265359;
+const float MIN_ROUGHNESS = 0.05;
+#include "pbr.glsl"
 
 void main() {
     int matIndex = clamp(fs_in.materialIndex, 0, materials.length() - 1);
     Material material = materials[matIndex];
+    if (material.baseColorTexture >= 0 && fs_in.uv.x > -1e20)
+        material.albedo *= texture(materialTextures, vec3(fs_in.uv, float(material.baseColorTexture))).rgb;
 
     vec3 N = normalize(fs_in.normal);
     vec3 V = normalize(uCameraPos - fs_in.worldPos);
-    float NdotV = max(dot(N, V), 0.0);
-
-    vec3 F0 = mix(vec3(0.04), material.albedo, material.metallic);
     vec3 color = uAmbientColor * material.albedo;
 
     for (int i = 0; i < numLights; ++i) {
@@ -82,24 +72,7 @@ void main() {
         float NdotL = max(dot(N, L), 0.0);
         if (NdotL <= 0.0) continue;
 
-        vec3 H = normalize(V + L);
-        float NdotH = max(dot(N, H), 0.0);
-        float VdotH = max(dot(V, H), 0.0);
-
-        float rough = clamp(material.roughness, 0.05, 1.0);
-        float D = distributionGGX(NdotH, rough);
-        float G = geometrySchlickGGX(NdotV, rough) * geometrySchlickGGX(NdotL, rough);
-        vec3 F = fresnelSchlick(VdotH, F0);
-
-        vec3 numerator = D * G * F;
-        float denominator = max(4.0 * NdotV * NdotL, 1e-4);
-        vec3 specular = numerator / denominator;
-
-        vec3 kS = F;
-        vec3 kD = (1.0 - kS) * (1.0 - material.metallic);
-        vec3 diffuse = kD * material.albedo / 3.14159;
-
-        color += (diffuse + specular) * light.color * attenuation * NdotL;
+        color += opaqueBRDF(material, N, V, L) * light.color * attenuation * NdotL;
     }
 
     if (material.transparency > 0.0) {

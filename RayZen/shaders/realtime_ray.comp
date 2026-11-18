@@ -1,0 +1,3 @@
+#version 430 core
+#define RAYZEN_SHADING_MODE 1
+#include "path_trace_shared.glsl"

@@ -38,3 +38,9 @@
 
 **/build
 .vscode
+
+# Local runtime and dependency caches
+**/bvh_cache/
+**/shaders/cache/
+**/vcpkg_installed/
+/RayZen/config/materials.ini

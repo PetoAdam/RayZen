@@ -27,6 +27,7 @@ enum class BVHSplitMethod {
 
 class BVH {
 public:
+    static constexpr int MaxDepth = 31;
     std::vector<BVHNode> nodes;
     std::vector<int> triIndices;
     // For TLAS

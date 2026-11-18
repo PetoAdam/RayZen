@@ -19,6 +19,8 @@ struct Material {
     float reflectivity;
     float transparency;
     float ior;
+    float subsurfaceMeanFreePath;
+    int baseColorTexture;
 };
 
 struct Light {
@@ -35,6 +37,10 @@ struct Triangle {
     vec3 v2;
     float pad2; // Padding to align to 16 bytes
     int materialIndex;
+    int hasUV;
+    vec2 uv0;
+    vec2 uv1;
+    vec2 uv2;
 };
 
 struct BVHNode {
@@ -105,11 +111,15 @@ uniform int debugBVHMode; // 0 = TLAS, 1 = BLAS
 uniform int debugSelectedBLAS; // mesh index
 uniform int debugSelectedTri; // triangle index within mesh
 uniform int uniformBounceBudget; // <=0 uses default bounce count
+uniform int uniformShadingMode;
+uniform bool uniformSubsurfaceEnabled;
 uniform int uniformAccumulatedFrames;
 uniform bool uniformResetAccumulation;
 uniform int uniformFrameIndex;
+uniform bool uniformUseImageAccumulation;
 uniform float uniformDisplayExposure;
 uniform vec3 uniformAmbientLightColor;
+layout(binding = 1) uniform sampler2DArray materialTextures;
 
 out vec4 FragColor;
 
@@ -123,73 +133,6 @@ struct Ray {
     vec3 origin;
     vec3 direction;
 };
-
-// FPS overlay font: 8x8 bitmap for digits 0-9 and '.' (11 chars)
-// Each row is a byte, LSB is leftmost pixel
-const int fontWidth = 8;
-const int fontHeight = 8;
-const int fontChars = 11; // 0-9 and '.'
-const int fontData[11][8] = int[11][8](
-    // '0'
-    int[8](0x3C,0x66,0x6E,0x7E,0x76,0x66,0x3C,0x00),
-    // '1'
-    int[8](0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0x00),
-    // '2'
-    int[8](0x3C,0x66,0x06,0x1C,0x30,0x66,0x7E,0x00),
-    // '3'
-    int[8](0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00),
-    // '4'
-    int[8](0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00),
-    // '5'
-    int[8](0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00),
-    // '6'
-    int[8](0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00),
-    // '7'
-    int[8](0x7E,0x66,0x0C,0x18,0x18,0x18,0x18,0x00),
-    // '8'
-    int[8](0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00),
-    // '9'
-    int[8](0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00),
-    // '.'
-    int[8](0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00)
-);
-
-// FPS uniform
-uniform float uniformFps;
-
-// Draw a single font character at pixel position (top-left), returns 1.0 if inside glyph, else 0.0
-float drawFontChar(int charIdx, vec2 fragCoord, vec2 pos, float scale) {
-    // Flip y for top-left origin
-    vec2 rel = (fragCoord - pos) / scale;
-    int x = int(rel.x);
-    int y = fontHeight - 1 - int(rel.y); // flip y
-    if (x < 0 || x >= fontWidth || y < 0 || y >= fontHeight) return 0.0;
-    int row = fontData[charIdx][y];
-    int mask = 1 << (fontWidth - 1 - x); // flip x for correct left-to-right
-    return float((row & mask) != 0);
-}
-
-// Draw a string of up to 8 chars (digits and '.') at pos, returns color overlay
-vec3 drawFpsString(vec2 fragCoord, vec2 pos, float scale, float fps, vec3 fg, vec3 bg) {
-    // Always draw as 3 digits, decimal, 1 digit: e.g. 042.7
-    int fpsInt = int(fps);
-    int tenths = int(fract(fps) * 10.0);
-    int hundreds = (fpsInt / 100) % 10;
-    int tens = (fpsInt / 10) % 10;
-    int ones = fpsInt % 10;
-    int chars[5];
-    chars[0] = hundreds;
-    chars[1] = tens;
-    chars[2] = ones;
-    chars[3] = 10; // '.'
-    chars[4] = tenths;
-    vec3 col = bg;
-    for (int i = 0; i < 5; ++i) {
-        float glyph = drawFontChar(chars[i], fragCoord, pos + vec2(i * (fontWidth+1) * scale, 0.0), scale);
-        col = mix(col, fg, glyph);
-    }
-    return col;
-}
 
 //------------------------------------------------------------------------------
 // Utility functions
@@ -230,6 +173,14 @@ vec3 acesToneMap(vec3 color) {
     const float d = 0.59;
     const float e = 0.14;
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+vec3 acesToneMapHue(vec3 color) {
+    float maxC = max(color.r, max(color.g, color.b));
+    if (maxC < 1e-6) return vec3(0.0);
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    float tonedMax = clamp((maxC * (a * maxC + b)) / (maxC * (c * maxC + d) + e), 0.0, 1.0);
+    return clamp(color * (tonedMax / maxC), 0.0, 1.0);
 }
 
 Ray calculateRay(vec2 uv, vec2 seed) {
@@ -366,7 +317,9 @@ void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor,
         for (int i = 0; i < bvhInstances.length(); ++i) {
             int rootIdx = bvhInstances[i].blasNodeOffset;
             BVHNode node = blasNodes[rootIdx];
-            float w = aabbWireframe(node.boundsMin, node.boundsMax, camera.projectionMatrix * camera.viewMatrix, fragCoord, 2.0);
+            float w = aabbWireframe(node.boundsMin, node.boundsMax,
+                                    camera.projectionMatrix * camera.viewMatrix * bvhInstances[i].transform,
+                                    fragCoord, 2.0);
             if (w > 0.0) {
                 vec3 black = vec3(0.0);
                 blasColor = mix(blasColor, black, w);
@@ -377,6 +330,7 @@ void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor,
         // BLAS mode: draw only the BVH branch for the selected triangle in the selected BLAS
         int selectedBLAS = debugSelectedBLAS;
         int selectedTri = debugSelectedTri;
+        if (selectedBLAS < 0 || selectedBLAS >= bvhInstances.length()) return;
         int nodeOffset = bvhInstances[selectedBLAS].blasNodeOffset;
         int triOffset = bvhInstances[selectedBLAS].blasTriOffset;
         int nodeCount = 0;
@@ -392,10 +346,7 @@ void overlayBVHWireframe(vec2 fragCoord, out float tlasWire, out vec3 tlasColor,
         mat4 viewProj = camera.projectionMatrix * camera.viewMatrix;
         for (int i = 0; i < pathLen; ++i) {
             BVHNode node = blasNodes[nodeOffset + path[i]];
-            // Transform AABB corners to world space using instanceTransform
-            vec3 bmin = (instanceTransform * vec4(node.boundsMin, 1.0)).xyz;
-            vec3 bmax = (instanceTransform * vec4(node.boundsMax, 1.0)).xyz;
-            float wire = aabbWireframe(bmin, bmax, viewProj, fragCoord, 2.0);
+            float wire = aabbWireframe(node.boundsMin, node.boundsMax, viewProj * instanceTransform, fragCoord, 2.0);
             blasWire = max(blasWire, wire);
             float hue = float(i) / float(pathLen);
             blasColor = mix(blasColor, hsv2rgb(vec3(hue, 1.0, 1.0)), wire);
@@ -419,7 +370,7 @@ bool intersectAABB(vec3 rayOrig, vec3 rayDirInv, vec3 bmin, vec3 bmax, out float
 }
 
 // Möller–Trumbore algorithm for triangle intersection
-bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {
+bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out vec2 uv) {
     vec3 edge1 = tri.v1 - tri.v0;
     vec3 edge2 = tri.v2 - tri.v0;
     vec3 h = cross(ray.direction, edge2);
@@ -441,13 +392,14 @@ bool hitTriangle(Triangle tri, Ray ray, out float tHit, out vec3 hitPoint, out v
         hitPoint = ray.origin + ray.direction * t;
         normal = normalize(cross(edge1, edge2));
         materialIndex = tri.materialIndex;
+        uv = tri.hasUV != 0 ? tri.uv0 * (1.0 - u - v) + tri.uv1 * u + tri.uv2 * v : vec2(-1e30);
         return true;
     }
     return false;
 }
 
 // Traverse BLAS for a mesh instance
-bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex) {    
+bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriOffset, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out vec2 uv) {
     tHit = 1e30;
     bool hit = false;
     int stack[64];
@@ -466,12 +418,14 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
                 float t;
                 vec3 tempHit, tempNormal;
                 int tempMat;
-                if (hitTriangle(triangles[triIdx], ray, t, tempHit, tempNormal, tempMat)) {
+                vec2 tempUV;
+                if (hitTriangle(triangles[triIdx], ray, t, tempHit, tempNormal, tempMat, tempUV)) {
                     if (t < tHit) {
                         tHit = t;
                         hitPoint = tempHit;
                         normal = tempNormal;
                         materialIndex = tempMat;
+                        uv = tempUV;
                         hit = true;
                     }
                 }
@@ -506,8 +460,9 @@ bool traverseBLAS(Ray ray, int blasNodeOffset, int blasTriOffset, int globalTriO
 }
 
 // Traverse TLAS, return closest hit and mesh instance index
-bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx) {
+bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx, out vec2 uv) {
     tHit = 1e30;
+    if (tlasNodes.length() == 0) return false;
     bool hit = false;
     int stack[64];
     int stackPtr = 0;
@@ -531,7 +486,8 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                 float tLocal;
                 vec3 localHit, localNormal;
                 int tempMat;
-                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat)) {
+                vec2 tempUV;
+                if (traverseBLAS(localRay, inst.blasNodeOffset, inst.blasTriOffset, inst.globalTriOffset, tLocal, localHit, localNormal, tempMat, tempUV)) {
                     // Transform hit point and normal back to world space
                     vec3 worldHit = vec3(inst.transform * vec4(localHit, 1.0));
                     float tWorld = length(worldHit - ray.origin); // world-space t
@@ -542,6 +498,7 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
                         normal = normalize(normalMatrix * localNormal);
                         materialIndex = tempMat;
                         instanceIdx = instIdx;
+                        uv = tempUV;
                         hit = true;
                     }
                 }
@@ -575,165 +532,20 @@ bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, o
     return hit;
 }
 
-// Shadow test: cast a ray and check for occlusion using TLAS/BLAS
-// Transparent-aware shadow query: accumulates transmission through multiple transparent objects
-bool shadowVisibility(vec3 origin, vec3 dir, float maxDist, out float visibility) {
-    visibility = 1.0;
-    float traveled = 0.0;
-    for (int iter = 0; iter < 32 && visibility > 0.05; ++iter) {
-        float tHit; vec3 hp, n; int matIdx; int inst;
-        if (!traverseTLAS(Ray(origin, dir), tHit, hp, n, matIdx, inst)) return true; // no more hits
-        if (tHit < RAY_EPSILON) { origin += dir * RAY_EPSILON; continue; }
-        traveled += tHit;
-        if (traveled >= maxDist) return true; // reached light
-        Material m = materials[matIdx];
-        if (m.transparency > 0.0) {
-            visibility *= m.transparency;
-            origin = offsetRayOrigin(hp, n, dir); // continue through
-            continue;
-        } else {
-            visibility = 0.0; // opaque blocker
-            return false;
-        }
-    }
-    return visibility > 0.05;
+bool traverseTLAS(Ray ray, out float tHit, out vec3 hitPoint, out vec3 normal, out int materialIndex, out int instanceIdx) {
+    vec2 uv;
+    return traverseTLAS(ray, tHit, hitPoint, normal, materialIndex, instanceIdx, uv);
 }
 
 //------------------------------------------------------------------------------
 // Lighting and material functions
 //------------------------------------------------------------------------------
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
-}
+#include "material_sampling.glsl"
 
-vec3 reflectRay(vec3 incident, vec3 normal) {
-    return incident - 2.0 * dot(incident, normal) * normal;
-}
+#define RAYZEN_FRAGMENT_BACKEND
+#include "direct_lighting.glsl"
 
-vec3 refractRay(vec3 incident, vec3 normal, float ior) {
-    float cosi = clamp(dot(incident, normal), -1.0, 1.0);
-    float etai = 1.0, etat = ior;
-    vec3 n = normal;
-    if (cosi < 0.0) {
-        cosi = -cosi;
-    } else {
-        float temp = etai;
-        etai = etat;
-        etat = temp;
-        n = -normal;
-    }
-    float eta = etai / etat;
-    float k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-    return (k < 0.0) ? reflectRay(incident, normal) : eta * incident + (eta * cosi - sqrt(k)) * n;
-}
-
-bool refractDir(vec3 incident, vec3 normal, float eta, out vec3 refr) {
-    // incident assumed normalized, normal points against incident when entering
-    float cosi = clamp(dot(-incident, normal), -1.0, 1.0);
-    float sint2 = max(0.0, 1.0 - cosi * cosi);
-    float eta2 = eta * eta;
-    float k = 1.0 - eta2 * sint2;
-    if (k < 0.0) return false; // total internal reflection
-    refr = normalize(eta * incident + (eta * cosi - sqrt(k)) * normal);
-    return true;
-}
-
-vec3 calculateLighting(vec3 hitPoint, vec3 normal, Material material, vec3 viewDir) {
-    // For transparent dielectrics: compute only specular reflection lobe (no diffuse)
-    if (material.transparency > 0.0) {
-        vec3 F0 = vec3(pow((1.0 - material.ior) / (1.0 + material.ior), 2.0));
-        vec3 specAccum = vec3(0.0);
-        for (int i = 0; i < numLights; ++i) {
-            if (i >= lights.length()) break;
-            Light light = lights[i];
-            vec3 L; float attenuation; float visibility;
-            if (light.positionOrDirection.w == 1.0) {
-                vec3 lv = light.positionOrDirection.xyz - hitPoint;
-                float dist = max(length(lv), 0.001);
-                L = lv / dist;
-                attenuation = light.power / (dist * dist);
-                if (!shadowVisibility(offsetRayOrigin(hitPoint, normal, L), L, dist, visibility)) continue;
-            } else {
-                L = normalize(light.positionOrDirection.xyz);
-                attenuation = light.power;
-                if (!shadowVisibility(offsetRayOrigin(hitPoint, normal, L), L, 1e30, visibility)) continue;
-            }
-            attenuation *= visibility;
-            float NdotL = max(dot(normal, L), 0.0);
-            if (NdotL <= 0.0) continue;
-            vec3 H = normalize(L + viewDir);
-            float NdotH = max(dot(normal, H), 0.0);
-            float cosTheta = max(dot(H, viewDir), 0.0);
-            vec3 F = fresnelSchlick(cosTheta, F0);
-            float rough = clamp(material.roughness, MIN_ROUGHNESS, 1.0);
-            float a = rough * rough;
-            float a2 = a * a;
-            float dDen = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-            float D = a2 / (PI * dDen * dDen + 1e-6);
-            float k = (rough + 1.0)*(rough + 1.0)/8.0;
-            float NdotV = max(dot(normal, viewDir), 0.0);
-            float Gv = NdotV / (NdotV * (1.0 - k) + k + 1e-6);
-            float Gl = NdotL / (NdotL * (1.0 - k) + k + 1e-6);
-            float denom = max(4.0 * NdotL * NdotV, 1e-4);
-            vec3 spec = (F * D * Gv * Gl) / denom;
-            specAccum += spec * light.color * attenuation * NdotL;
-        }
-        return specAccum;
-    }
-    vec3 F0 = mix(vec3(0.04), material.albedo, material.metallic);
-    vec3 finalColor = uniformAmbientLightColor * material.albedo;
-
-    // Loop over lights (assumed 10 lights maximum)
-    for (int i = 0; i < numLights; ++i) {
-        if (i >= lights.length()) break; // safety
-        Light light = lights[i];
-        vec3 lightDir;
-        float attenuation = 1.0;
-        float visibility;
-
-        if (light.positionOrDirection.w == 1.0) { // Point light
-            vec3 lightVec = light.positionOrDirection.xyz - hitPoint;
-            float distance = max(length(lightVec), 0.001);
-            lightDir = normalize(lightVec);
-            attenuation = light.power / (distance * distance);
-
-            // Check shadows for point lights
-            if (!shadowVisibility(offsetRayOrigin(hitPoint, normal, lightDir), lightDir, distance, visibility)) continue;
-        } else { // Directional light
-            lightDir = normalize(light.positionOrDirection.xyz);
-            attenuation = light.power;
-
-            if (!shadowVisibility(offsetRayOrigin(hitPoint, normal, lightDir), lightDir, 1e30, visibility)) continue;
-        }
-        attenuation *= visibility;
-
-        // Calculate shading terms
-        vec3 halfwayDir = normalize(lightDir + viewDir);
-        float NdotL = max(dot(normal, lightDir), 0.0);
-        float NdotV = max(dot(normal, viewDir), 0.0);
-
-        vec3 F = fresnelSchlick(max(dot(halfwayDir, viewDir), 0.0), F0);
-
-        float roughness = clamp(material.roughness, MIN_ROUGHNESS, 1.0);
-        float alpha = roughness * roughness;
-        float alpha2 = alpha * alpha;
-        float denom = (dot(normal, halfwayDir) * dot(normal, halfwayDir) * (alpha2 - 1.0) + 1.0);
-        float D = alpha2 / max(PI * denom * denom, 1e-5);
-
-        float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-        float G = NdotV / (NdotV * (1.0 - k) + k);
-        G *= NdotL / (NdotL * (1.0 - k) + k);
-
-        float denomSpec = max(4.0 * NdotV * NdotL, 0.0001);
-        vec3 specular = (F * D * G) / denomSpec;
-
-        vec3 diffuse = (1.0 - F) * (1.0 - material.metallic) * material.albedo * NdotL / PI;
-
-        finalColor += max(vec3(0.0), (diffuse + specular) * light.color * attenuation);
-    }
-
-    return finalColor;
-}
+#include "ray_tracing.glsl"
 
 //------------------------------------------------------------------------------
 // Main path tracing loop
@@ -744,8 +556,7 @@ void main() {
     vec2 seed = uv + frameSeed;
 
     vec3 radiance = vec3(0.0);
-    int maxBounces = uniformBounceBudget > 0 ? uniformBounceBudget : 5;
-    float currentIor = 1.0; // track medium IOR (air)
+    int maxBounces = uniformShadingMode == 0 ? max(uniformBounceBudget, 1) : 1;
     int numSamples = 1; // increase for better quality
 
     // BVH debug overlay variables
@@ -758,24 +569,52 @@ void main() {
         overlayBVHWireframe(gl_FragCoord.xy, tlasWire, tlasColor, blasWire, blasColor);
     }
 
-    for (int samp = 0; samp < numSamples; ++samp) {
+    if (uniformShadingMode == 1) {
+        seed = (uv + frameSeed) * float(gl_FragCoord.x + gl_FragCoord.y + 1.0);
+        radiance = traceRealtime(calculateRay(uv, seed), seed);
+    } else for (int samp = 0; samp < numSamples; ++samp) {
         seed = (uv + frameSeed) * float(gl_FragCoord.x + gl_FragCoord.y + samp + 1.0);
         Ray ray = calculateRay(uv, seed);
         vec3 currentOrigin = ray.origin;
         vec3 currentDirection = ray.direction;
         vec3 throughput = vec3(1.0);
+        int mediumInstance = -1;
+        int mediumMaterial = -1;
+        vec3 mediumAlbedo = vec3(1.0);
         bool hitSomething = false;
 
         for (int bounce = 0; bounce < maxBounces; ++bounce) {
-            vec2 tempseed = seed * float(bounce * bounce) * 12793.46 + float(bounce) * 1423.34;
+            vec2 tempseed = seed * float((bounce + 1) * (bounce + 1)) * 12793.46 + float(bounce) * 1423.34;
             vec3 hitPoint, hitNormal;
             int materialIndex = -1;
             int instanceIdx = -1;
             float closestT = 1e30;
             Material hitMaterial;
+            vec2 hitUV;
 
             // Use TLAS/BLAS traversal for intersection
-            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx);
+            bool found = traverseTLAS(Ray(currentOrigin, currentDirection), closestT, hitPoint, hitNormal, materialIndex, instanceIdx, hitUV);
+            if (mediumInstance >= 0) {
+                Material medium = materials[mediumMaterial];
+                medium.albedo = mediumAlbedo;
+                if (uniformSubsurfaceEnabled && medium.subsurfaceMeanFreePath > 0.0) {
+                    float distance = -log(max(1.0 - rand(tempseed + vec2(63.1, 8.7)), 1e-6)) *
+                                     medium.subsurfaceMeanFreePath;
+                    if (distance < closestT) {
+                        vec3 scatterPoint = currentOrigin + currentDirection * distance;
+                        throughput *= clamp(medium.albedo, vec3(0.0), vec3(1.0));
+                        radiance += throughput * subsurfaceDirectLight(scatterPoint, mediumInstance, medium);
+                        if (bounce + 1 >= maxBounces) break;
+                        currentOrigin = scatterPoint;
+                        currentDirection = randomSphereDirection(tempseed);
+                        continue;
+                    }
+                } else if (found) {
+                    vec3 transmittance = clamp(medium.albedo * medium.transparency, vec3(0.0001), vec3(1.0));
+                    throughput *= pow(transmittance, vec3(closestT));
+                }
+                if (!found || instanceIdx != mediumInstance) break;
+            }
             if (!found) {
                 // Skybox: blueish gradient, less bright
                 float t = 0.5 * (normalize(currentDirection).y + 1.0);
@@ -785,56 +624,37 @@ void main() {
             }
             hitSomething = true;
             hitMaterial = materials[materialIndex];
+            applyBaseColorTexture(hitMaterial, hitUV);
             vec3 viewDir = normalize(-currentDirection);
-            // Only add explicit direct lighting on first bounce to avoid energy blow-up without MIS
-            if (bounce == 0) {
-                radiance += throughput * calculateLighting(hitPoint, hitNormal, hitMaterial, viewDir);
-            }
+            vec3 shadingNormal = dot(hitNormal, viewDir) >= 0.0 ? hitNormal : -hitNormal;
+            if (mediumInstance < 0)
+                radiance += throughput * calculateLighting(hitPoint, shadingNormal, hitMaterial, viewDir, bounce == 0);
+            if (bounce + 1 >= maxBounces) break;
 
             float randVal = rand(tempseed + vec2(float(samp), float(bounce)));
 
             // Transparent / refractive handling
-            if (hitMaterial.transparency > 0.0) {
-                // Deterministic dielectric: always refract (unless TIR) and rely on direct spec for reflection.
-                bool entering = dot(-currentDirection, hitNormal) > 0.0;
-                vec3 N = entering ? hitNormal : -hitNormal; // outward normal relative to current medium
-                float extIor = currentIor;
-                float nextIor = entering ? hitMaterial.ior : 1.0;
-                float eta = extIor / nextIor;
-                float cosi = clamp(dot(-currentDirection, N), 0.0, 1.0);
-                float F0 = pow((extIor - nextIor) / (extIor + nextIor), 2.0);
-                float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosi, 5.0);
-                vec3 refr;
-                bool ok = refractDir(currentDirection, N, eta, refr);
-                if (!ok) { // Total internal reflection: fallback reflect only
-                    currentDirection = reflectRay(currentDirection, N);
-                    // Slight energy trim
-                    throughput *= vec3(0.98);
-                } else {
-                    // Apply transmission weighting; leave reflection handled by spec direct term
-                    currentDirection = refr;
-                    currentIor = nextIor;
-                    vec3 tint = mix(vec3(1.0), hitMaterial.albedo, 0.35);
-                    vec3 transmitWeight = tint * hitMaterial.transparency * (1.0 - fresnel);
-                    throughput *= clamp(transmitWeight, vec3(0.0), vec3(1.0));
+            if (hitMaterial.transparency > 0.0 ||
+                (uniformSubsurfaceEnabled && hitMaterial.subsurfaceMeanFreePath > 0.0)) {
+                bool entering = mediumInstance < 0;
+                float ior = max(hitMaterial.ior, 0.001);
+                if (sampleDielectric(currentDirection, shadingNormal, entering ? 1.0 : ior,
+                                     entering ? ior : 1.0, randVal, currentDirection)) {
+                    mediumInstance = entering ? instanceIdx : -1;
+                    mediumMaterial = entering ? materialIndex : -1;
+                    if (entering) mediumAlbedo = hitMaterial.albedo;
                 }
-                // Advanced: could add chromatic dispersion here by varying IOR per channel
             } else {
-                // Opaque: reflect vs diffuse based on reflectivity
-                if (randVal < hitMaterial.reflectivity) {
-                    currentDirection = reflectRay(currentDirection, hitNormal);
-                    throughput *= vec3(0.95); // slight loss to prevent runaway brightness
-                } else {
-                    currentDirection = randomHemisphereDirection(hitNormal, tempseed);
-                    throughput *= hitMaterial.albedo * (1.0 - hitMaterial.metallic);
-                }
+                vec3 weight;
+                if (!sampleOpaque(hitMaterial, shadingNormal, viewDir, tempseed, currentDirection, weight)) break;
+                throughput *= weight;
             }
             currentOrigin = offsetRayOrigin(hitPoint, hitNormal, currentDirection);
 
             // Russian roulette termination after a few bounces
             if (bounce > 2) {
                 float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
-                if (rand(tempseed + vec2(float(samp), float(bounce))) > p)
+                if (rand(tempseed + vec2(31.73 + float(samp), 47.29 + float(bounce))) > p)
                     break;
                 throughput /= p;
             }
@@ -843,16 +663,18 @@ void main() {
     vec3 sampleRadiance = max(radiance / float(numSamples), vec3(0.0));
     sampleRadiance = clampRadiancePreserveHue(sampleRadiance, 8.0);
 
-    ivec2 pixelCoord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), imageSize(accumulationImage) - ivec2(1));
     vec3 accumulatedRadiance = sampleRadiance;
-    if (!uniformResetAccumulation && uniformAccumulatedFrames > 0) {
-        vec3 previousRadiance = imageLoad(accumulationImage, pixelCoord).rgb;
-        float blend = 1.0 / (float(uniformAccumulatedFrames) + 1.0);
-        accumulatedRadiance = mix(previousRadiance, sampleRadiance, blend);
+    if (uniformUseImageAccumulation) {
+        ivec2 pixelCoord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), imageSize(accumulationImage) - ivec2(1));
+        if (!uniformResetAccumulation && uniformAccumulatedFrames > 0) {
+            vec3 previousRadiance = imageLoad(accumulationImage, pixelCoord).rgb;
+            float blend = 1.0 / (float(uniformAccumulatedFrames) + 1.0);
+            accumulatedRadiance = mix(previousRadiance, sampleRadiance, blend);
+        }
+        imageStore(accumulationImage, pixelCoord, vec4(accumulatedRadiance, 1.0));
     }
-    imageStore(accumulationImage, pixelCoord, vec4(accumulatedRadiance, 1.0));
 
-    vec3 color = acesToneMap(accumulatedRadiance * uniformDisplayExposure);
+    vec3 color = acesToneMapHue(accumulatedRadiance * uniformDisplayExposure);
     color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
 
     // Overlay BVH wireframe if enabled
@@ -884,22 +706,6 @@ void main() {
             }
         }
     }
-
-    // FPS overlay (top-left, white text, black bg)
-    float margin = 8.0;
-    vec2 fpsPos = vec2(margin, resolution.y - margin - fontHeight * 2.0); // top-left
-    float fpsScale = 2.0; // 2x font size
-    vec3 fpsCol = drawFpsString(gl_FragCoord.xy, fpsPos, fpsScale, uniformFps, vec3(1.0), color);
-    float anyFps = 0.0;
-    for (int y = 0; y < fontHeight; ++y) {
-        for (int x = 0; x < fontWidth * 6; ++x) {
-            vec2 p = fpsPos + vec2(x, y) * fpsScale;
-            if (abs(gl_FragCoord.x - p.x) < 1.0 && abs(gl_FragCoord.y - p.y) < 1.0) {
-                anyFps = 1.0;
-            }
-        }
-    }
-    color = mix(color, fpsCol, anyFps);
 
     FragColor = vec4(color, 1.0);
 }

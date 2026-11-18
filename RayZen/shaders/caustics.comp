@@ -1,0 +1,147 @@
+#version 430 core
+#define RAYZEN_CAUSTIC_PASS
+#include "path_trace_shared.glsl"
+
+uniform vec3 causticTargetCenter;
+uniform float causticTargetRadius;
+uniform int causticTargetInstance;
+uniform int causticLightIndex;
+uniform int causticPhotonCount;
+
+uint hashPhoton(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+
+float photonRandom(uint x) {
+    return float(hashPhoton(x) >> 8) * (1.0 / 16777216.0);
+}
+
+void addPhoton(int index, uint amount) {
+    uint old = imageAtomicAdd(causticPixels, index, 0u);
+    for (;;) {
+        uint next = amount > 0xffffffffu - old ? 0xffffffffu : old + amount;
+        uint previous = imageAtomicCompSwap(causticPixels, index, old, next);
+        if (previous == old) return;
+        old = previous;
+    }
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y *
+              gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (id >= uint(causticPhotonCount)) return;
+    uint seed = id * 3u + uint(uniformFrameIndex) * 0x9e3779b9u;
+    float u = photonRandom(seed), v = photonRandom(seed + 1u);
+    Light light = lights[causticLightIndex];
+    vec3 origin, direction, axis;
+    float flux;
+    float radius = causticTargetRadius;
+    if (light.positionOrDirection.w == 1.0) {
+        origin = light.positionOrDirection.xyz;
+        vec3 delta = causticTargetCenter - origin;
+        float distance = length(delta);
+        axis = distance > 1e-6 ? delta / distance : vec3(0,0,1);
+        float sinMax2 = distance <= radius ? 1.0 : radius * radius / (distance * distance);
+        float oneMinusCos = distance <= radius ? 2.0 : sinMax2 / (1.0 + sqrt(1.0 - sinMax2));
+        float cosine = 1.0 - u * oneMinusCos;
+        float sine = sqrt(max(0.0, 1.0 - cosine * cosine));
+        vec3 up = abs(axis.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
+        vec3 tangent = normalize(cross(up, axis));
+        direction = normalize(axis * cosine + sine *
+                    (tangent * cos(2.0 * PI * v) + cross(axis, tangent) * sin(2.0 * PI * v)));
+        flux = light.power * 2.0 * PI * oneMinusCos;
+    } else {
+        axis = normalize(light.positionOrDirection.xyz);
+        vec3 up = abs(axis.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
+        vec3 tangent = normalize(cross(up, axis));
+        float r = radius * sqrt(u), phi = 2.0 * PI * v;
+        origin = causticTargetCenter + axis * (radius + RAY_EPSILON * 2.0) +
+                 r * (tangent * cos(phi) + cross(axis, tangent) * sin(phi));
+        direction = -axis;
+        flux = light.power * PI * radius * radius;
+        float blockerDistance;
+        vec3 blockerPoint, blockerNormal;
+        int blockerMaterial, blockerInstance;
+        if (traverseTLAS(Ray(origin, axis), blockerDistance, blockerPoint, blockerNormal,
+                         blockerMaterial, blockerInstance)) return;
+    }
+
+    vec3 power = light.color * (flux / float(causticPhotonCount));
+    int medium = -1;
+    vec3 mediumTransmittance = vec3(1.0);
+    bool passedGlass = false;
+    for (int bounce = 0; bounce < 8; ++bounce) {
+        float t;
+        vec3 point, normal;
+        int matIndex, instance;
+        vec2 uv;
+        if (!traverseTLAS(Ray(origin, direction), t, point, normal, matIndex, instance, uv)) return;
+        if (medium >= 0) {
+            if (instance != medium) return;
+            power *= pow(mediumTransmittance, vec3(t));
+        }
+        Material material = materials[matIndex];
+        applyBaseColorTexture(material, uv);
+        if (material.transparency > 0.0) {
+            if ((!passedGlass && instance != causticTargetInstance) ||
+                (passedGlass && medium < 0)) return;
+            bool entering = medium < 0;
+            if ((entering && dot(direction, normal) >= 0.0) ||
+                (!entering && dot(direction, normal) <= 0.0)) return;
+            vec3 boundaryNormal = dot(direction, normal) < 0.0 ? normal : -normal;
+            float ior = max(material.ior, 0.001);
+            float fromIor = entering ? 1.0 : ior, toIor = entering ? ior : 1.0;
+            float fresnel = dielectricFresnel(clamp(dot(-direction, boundaryNormal), 0.0, 1.0),
+                                              fromIor, toIor);
+            vec3 transmitted = refract(direction, boundaryNormal, fromIor / toIor);
+            if (fresnel >= 1.0 || dot(transmitted, transmitted) < 1e-8) return;
+            power *= 1.0 - fresnel;
+            direction = normalize(transmitted);
+            medium = entering ? instance : -1;
+            if (entering)
+                mediumTransmittance = clamp(material.albedo * material.transparency, vec3(0.0001), vec3(1.0));
+            passedGlass = true;
+            origin = offsetRayOrigin(point, normal, direction);
+            continue;
+        }
+        if (!passedGlass || medium >= 0) return;
+        vec3 incoming = -direction;
+        normal = dot(normal, incoming) >= 0.0 ? normal : -normal;
+        vec3 toCamera = camera.position - point;
+        float distance = length(toCamera);
+        if (distance <= RAY_EPSILON) return;
+        vec3 viewDir = toCamera / distance;
+        float facing = dot(normal, viewDir);
+        if (facing <= 0.0) return;
+        float obstruction;
+        vec3 hp, hn;
+        int blockerMaterial, blockerInstance;
+        if (traverseTLAS(Ray(offsetRayOrigin(point, normal, viewDir), viewDir),
+                         obstruction, hp, hn, blockerMaterial, blockerInstance) &&
+            obstruction < distance - 2.0 * RAY_EPSILON) return;
+        vec4 clip = camera.projectionMatrix * camera.viewMatrix * vec4(point, 1.0);
+        if (clip.w <= 0.0) return;
+        vec2 screen = (clip.xy / clip.w * 0.5 + 0.5) * resolution;
+        ivec2 pixel = ivec2(screen);
+        vec3 viewPoint = (camera.viewMatrix * vec4(point, 1.0)).xyz;
+        float cosAxis = abs(viewPoint.z) / max(length(viewPoint), 1e-6);
+        float pixelSolidAngle = 4.0 * cosAxis * cosAxis * cosAxis /
+            (camera.projectionMatrix[0][0] * camera.projectionMatrix[1][1] * resolution.x * resolution.y);
+        float area = distance * distance * pixelSolidAngle / facing;
+        vec3 brdf = uniformShadingMode == 2 ? material.albedo / PI :
+                    opaqueBRDF(material, normal, viewDir, incoming);
+        vec3 radiance = power * brdf / max(area * 9.0, 1e-8);
+        uvec3 fixedValue = uvec3(clamp(radiance * 1048576.0, vec3(0), vec3(4294960000.0)));
+        for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+            ivec2 p = pixel + ivec2(x, y);
+            if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(resolution)))) continue;
+            int index = (p.y * int(resolution.x) + p.x) * 4;
+            addPhoton(index, fixedValue.r);
+            addPhoton(index + 1, fixedValue.g);
+            addPhoton(index + 2, fixedValue.b);
+        }
+        return;
+    }
+}

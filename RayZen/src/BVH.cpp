@@ -6,6 +6,7 @@
 struct BVHBuildEntry {
     int nodeIdx;
     int start, end;
+    int depth;
 };
 
 static void computeBounds(const std::vector<Triangle>& tris, const std::vector<int>& triIndices, int start, int end, glm::vec3& bmin, glm::vec3& bmax) {
@@ -100,9 +101,10 @@ void BVH::buildBLAS(const std::vector<Triangle>& tris) {
     triIndices.resize(tris.size());
     for (int i = 0; i < (int)tris.size(); ++i) triIndices[i] = i;
     nodes.clear();
+    if (tris.empty()) return;
     nodes.reserve(tris.size() * 2);
     std::vector<BVHBuildEntry> stack;
-    stack.push_back({0, 0, (int)tris.size()});
+    stack.push_back({0, 0, (int)tris.size(), 0});
     nodes.push_back({glm::vec3(0), 0, glm::vec3(0), 0}); // root
     while (!stack.empty()) {
         BVHBuildEntry e = stack.back(); stack.pop_back();
@@ -112,7 +114,7 @@ void BVH::buildBLAS(const std::vector<Triangle>& tris) {
         computeBounds(tris, triIndices, start, end, bmin, bmax);
         nodes[nidx].boundsMin = bmin;
         nodes[nidx].boundsMax = bmax;
-        if (count <= 4) { // leaf
+        if (count <= 4 || e.depth >= MaxDepth) { // leaf
             nodes[nidx].leftFirst = start;
             nodes[nidx].count = count;
             continue;
@@ -169,8 +171,8 @@ void BVH::buildBLAS(const std::vector<Triangle>& tris) {
         nodes[nidx].count = -1;
         nodes.push_back({});
         nodes.push_back({});
-        stack.push_back({rightIdx, mid, end});
-        stack.push_back({leftIdx, start, mid});
+        stack.push_back({rightIdx, mid, end, e.depth + 1});
+        stack.push_back({leftIdx, start, mid, e.depth + 1});
     }
 }
 
@@ -179,12 +181,13 @@ void BVH::buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::ve
     triIndices.clear();
     nodes.clear();
     int numMeshes = (int)meshInstances.size();
+    if (numMeshes == 0) return;
     // Each mesh's root node AABB
     std::vector<int> meshIndices(numMeshes);
     for (int i = 0; i < numMeshes; ++i) meshIndices[i] = i;
     // Stack for iterative build
     std::vector<BVHBuildEntry> stack;
-    stack.push_back({0, 0, numMeshes});
+    stack.push_back({0, 0, numMeshes, 0});
     nodes.push_back({glm::vec3(0), 0, glm::vec3(0), 0}); // root
     while (!stack.empty()) {
         BVHBuildEntry e = stack.back(); stack.pop_back();
@@ -201,10 +204,10 @@ void BVH::buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::ve
         }
         nodes[nidx].boundsMin = bmin;
         nodes[nidx].boundsMax = bmax;
-        if (count == 1) { // leaf: single instance
+        if (count == 1 || e.depth >= MaxDepth) {
             nodes[nidx].leftFirst = (int)triIndices.size();
-            nodes[nidx].count = 1;
-            triIndices.push_back(meshIndices[start]);
+            nodes[nidx].count = count;
+            for (int i = start; i < end; ++i) triIndices.push_back(meshIndices[i]);
             continue;
         }
         //if (count == 2) { // leaf: two instances
@@ -234,8 +237,8 @@ void BVH::buildTLAS(const std::vector<BVHInstance>& meshInstances, const std::ve
         nodes[nidx].count = -1;
         nodes.push_back({});
         nodes.push_back({});
-        stack.push_back({rightIdx, mid, end});
-        stack.push_back({leftIdx, start, mid});
+        stack.push_back({rightIdx, mid, end, e.depth + 1});
+        stack.push_back({leftIdx, start, mid, e.depth + 1});
     }
 }
 
